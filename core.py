@@ -57,22 +57,31 @@ CONFIG = {
     # --- prompt ---
     "context_minutes": None,      # how much transcript goes to Claude (None = all of it)
     "history_pairs": None,        # how many previous Q/A pairs go to Claude (None = all)
+    "screenshot_max_side": 1920,  # screenshots bigger than this are scaled down (0 = never)
     # --- window ---
     "opacity": 0.92,
     "width": 540,
     "height": 460,
     "font_size": 11,
+    # Defaults; the ⚙ button of the overlay changes them and saves to settings.json.
     "hotkeys": {
         "ask": "ctrl+alt+enter",      # answer from the transcript (+ typed question)
+        "screenshot": "ctrl+alt+s",   # screenshot of the screen -> Claude right away
         "toggle": "ctrl+alt+h",       # show / hide the overlay
         "listen": "ctrl+alt+l",       # pause / resume listening
         "auto": "ctrl+alt+a",         # voice mode on / off
         "focus": "ctrl+alt+t",        # put the cursor into the question field
         "clear": "ctrl+alt+c",        # clear transcript and answer
         "model": "ctrl+alt+z",        # switch claude_model <-> claude_model_alt
+        "settings": "",               # open the hotkey settings
         "quit": "ctrl+alt+q",
     },
+    # Mouse buttons for the same actions: "mouse3" (wheel click), "mouse4", "mouse5"
+    # (side buttons), with modifiers if wanted: "ctrl+mouse4". Empty = none.
+    "mouse_hotkeys": {},
 }
+
+SETTINGS_FILE = APP_DIR / "settings.json"  # what the user changed in the overlay
 
 SYSTEM_PROMPT = """Ти — підказувач у маленькому вікні поверх екрана під час живої розмови. Користувач читає тебе на ходу, тому відповідь має читатися за кілька секунд.
 
@@ -108,8 +117,24 @@ SYSTEM_PROMPT = """Ти — підказувач у маленькому вік�
 # ----------------------------------------------------------------- config
 
 def load_config() -> dict:
-    """A copy of CONFIG, so that changes at run time do not touch the original."""
-    return copy.deepcopy(CONFIG)
+    """A copy of CONFIG with the hotkeys saved from the overlay (settings.json)."""
+    cfg = copy.deepcopy(CONFIG)
+    try:
+        saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    for section in ("hotkeys", "mouse_hotkeys"):
+        values = saved.get(section) if isinstance(saved, dict) else None
+        if isinstance(values, dict):
+            cfg[section].update({action: combo for action, combo in values.items()
+                                 if action in CONFIG["hotkeys"] and isinstance(combo, str)})
+    return cfg
+
+
+def save_settings(cfg: dict):
+    """Keep the hotkeys chosen in the overlay for the next start."""
+    data = {section: dict(cfg[section]) for section in ("hotkeys", "mouse_hotkeys")}
+    SETTINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # ---------------------------------------------------------------- hotkeys
@@ -117,29 +142,96 @@ def load_config() -> dict:
 MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN = 0x1, 0x2, 0x4, 0x8
 _MODS = {"alt": MOD_ALT, "ctrl": MOD_CONTROL, "control": MOD_CONTROL,
          "shift": MOD_SHIFT, "win": MOD_WIN}
+_MOD_ORDER = (("ctrl", MOD_CONTROL), ("alt", MOD_ALT), ("shift", MOD_SHIFT), ("win", MOD_WIN))
+# The first name of a code is the one written into settings.
 _KEYS = {"space": 0x20, "enter": 0x0D, "return": 0x0D, "tab": 0x09, "esc": 0x1B,
          "escape": 0x1B, "backspace": 0x08, "insert": 0x2D, "delete": 0x2E,
          "home": 0x24, "end": 0x23, "pageup": 0x21, "pagedown": 0x22,
-         "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28}
+         "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28,
+         "printscreen": 0x2C, "pause": 0x13, "scrolllock": 0x91,
+         "semicolon": 0xBA, "plus": 0xBB, "comma": 0xBC, "minus": 0xBD, "period": 0xBE,
+         "slash": 0xBF, "backquote": 0xC0, "lbracket": 0xDB, "backslash": 0xDC,
+         "rbracket": 0xDD, "quote": 0xDE,
+         "num*": 0x6A, "num+": 0x6B, "num-": 0x6D, "num.": 0x6E, "num/": 0x6F,
+         **{f"num{i}": 0x60 + i for i in range(10)}}
+_KEY_NAMES: dict[int, str] = {}
+for _name, _vk in _KEYS.items():
+    _KEY_NAMES.setdefault(_vk, _name)
+# Keys that may be a hotkey without Ctrl/Alt/Shift/Win: they do not type text.
+_SOLO_KEYS = {"insert", "pause", "scrolllock", "printscreen"}
+
+MOUSE_BUTTONS = {"mouse3": "Колесо (клік)", "mouse4": "Бічна 1", "mouse5": "Бічна 2"}
+
+
+def _split_combo(text: str) -> tuple[int, list[str]]:
+    mods, rest = 0, []
+    for part in text.lower().replace(" ", "").split("+"):
+        if part in _MODS:
+            mods |= _MODS[part]
+        elif part:
+            rest.append(part)
+    return mods, rest
 
 
 def parse_hotkey(text: str) -> tuple[int, int]:
     """'ctrl+alt+s' -> (modifiers, virtual key code) for RegisterHotKey."""
-    mods, vk = 0, None
-    for part in text.lower().replace(" ", "").split("+"):
-        if part in _MODS:
-            mods |= _MODS[part]
-        elif part in _KEYS:
-            vk = _KEYS[part]
-        elif len(part) == 1 and (part.isalpha() or part.isdigit()):
-            vk = ord(part.upper())
-        elif part.startswith("f") and part[1:].isdigit() and 1 <= int(part[1:]) <= 24:
-            vk = 0x70 + int(part[1:]) - 1
-        else:
-            raise ValueError(f"unknown key '{part}' in hotkey '{text}'")
-    if vk is None:
-        raise ValueError(f"hotkey '{text}' has no main key")
+    mods, rest = _split_combo(text)
+    if len(rest) != 1:
+        raise ValueError(f"hotkey '{text}' must have exactly one main key")
+    part = rest[0]
+    if part in _KEYS:
+        vk = _KEYS[part]
+    elif len(part) == 1 and (part.isascii() and (part.isalpha() or part.isdigit())):
+        vk = ord(part.upper())
+    elif part.startswith("f") and part[1:].isdigit() and 1 <= int(part[1:]) <= 24:
+        vk = 0x70 + int(part[1:]) - 1
+    else:
+        raise ValueError(f"unknown key '{part}' in hotkey '{text}'")
     return mods, vk
+
+
+def parse_mouse(text: str) -> tuple[int, str]:
+    """'ctrl+mouse4' -> (modifiers, button name)."""
+    mods, rest = _split_combo(text)
+    if len(rest) != 1 or rest[0] not in MOUSE_BUTTONS:
+        raise ValueError(f"unknown mouse button in '{text}' (mouse3, mouse4 or mouse5)")
+    return mods, rest[0]
+
+
+def key_name(vk: int) -> str | None:
+    """Virtual key code -> its name in a hotkey ('s', 'f5', 'enter'); None if unsupported."""
+    if 0x41 <= vk <= 0x5A or 0x30 <= vk <= 0x39:
+        return chr(vk).lower()
+    if 0x70 <= vk <= 0x87:
+        return f"f{vk - 0x70 + 1}"
+    return _KEY_NAMES.get(vk)
+
+
+def needs_modifier(name: str) -> bool:
+    """A key that types text or moves the cursor would be taken from every program."""
+    return not (name in _SOLO_KEYS or name.startswith("num")
+                or (name.startswith("f") and name[1:].isdigit()))
+
+
+def make_combo(mods: int, main: str) -> str:
+    """(modifiers, key or button name) -> 'ctrl+alt+s', in a fixed order."""
+    return "+".join([name for name, bit in _MOD_ORDER if mods & bit] + [main])
+
+
+def pretty_combo(text: str) -> str:
+    """'ctrl+alt+mouse4' -> 'Ctrl+Alt+Бічна 1' for the window."""
+    if not text:
+        return ""
+    mods, rest = _split_combo(text)
+    names = [name.capitalize() for name, bit in _MOD_ORDER if mods & bit]
+    for part in rest:
+        if part in MOUSE_BUTTONS:
+            names.append(MOUSE_BUTTONS[part])
+        elif len(part) == 1 or (part[0] == "f" and part[1:].isdigit()):
+            names.append(part.upper())
+        else:
+            names.append(part.capitalize())
+    return "+".join(names)
 
 
 # ------------------------------------------------------------------ audio
@@ -329,10 +421,12 @@ class Transcript:
 
 def build_prompt(question: str, transcript: list[tuple[str, str]],
                  history: list[tuple[str, str]], files: list[str] | None = None,
-                 pinned: list[str] | None = None, pinned_read: bool = False) -> str:
+                 pinned: list[str] | None = None, pinned_read: bool = False,
+                 screenshot: bool = False) -> str:
     """files: names of attachments for this question; pinned: names of files for the
     whole session. Both lie in ATTACH_DIR, the working folder of Claude Code.
-    pinned_read: the conversation already contains Claude's full reading of them."""
+    pinned_read: the conversation already contains Claude's full reading of them.
+    screenshot: the last file is a screenshot the user just took; it is what to answer."""
     parts = []
     if pinned and pinned_read:
         parts.append("Матеріали сеансу (" + ", ".join(pinned) + ") ти вже повністю прочитав вище. "
@@ -356,6 +450,11 @@ def build_prompt(question: str, transcript: list[tuple[str, str]],
                      "\nСпершу прочитай їх інструментом Read і врахуй у відповіді.")
     if question:
         parts.append("Запитання користувача: " + question)
+    elif screenshot:
+        parts.append("Запитання не задано. Користувач щойно зробив знімок свого екрана "
+                     f"({files[-1]}). Якщо на ньому задача, тест, код чи запитання — дай "
+                     "розв'язок чи відповідь; інакше коротко поясни, що на ньому важливо. "
+                     "Транскрипт — лише контекст.")
     elif files and not transcript:
         parts.append("Запитання не задано. Допоможи з тим, що у файлах: якщо там задача "
                      "або запитання — дай розв'язок чи відповідь, інакше коротко поясни зміст.")

@@ -43,6 +43,14 @@ log = logging.getLogger("overlay")
 for _name in ("faster_whisper", "httpx", "httpx2", "huggingface_hub"):
     logging.getLogger(_name).setLevel(logging.WARNING)
 
+# pythonw has nowhere to print errors: errors in Qt slots (button clicks) and in
+# background threads would vanish without a trace, so they go to the log.
+sys.excepthook = lambda kind, value, tb: log.error(
+    "uncaught error:\n%s", "".join(traceback.format_exception(kind, value, tb)))
+threading.excepthook = lambda args: log.error(
+    "error in thread %s:\n%s", args.thread.name if args.thread else "?",
+    "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)))
+
 
 def fatal(message: str):
     log.error(message)
@@ -150,32 +158,195 @@ def default_audio_ids() -> tuple[str, str]:
     return ids[0], ids[1]
 
 
-class HotkeyFilter(QtCore.QAbstractNativeEventFilter):
-    """Global hotkeys through RegisterHotKey: they work while another app has focus."""
+class GlobalHotkeys(QtCore.QObject):
+    """Global hotkeys through RegisterHotKey: they work while another app has focus.
+
+    They live in their own thread with its own message loop, not in a Qt native
+    event filter: PySide6 6.12 breaks when Qt calls a Python filter in the middle
+    of a slot (e.g. while a dialog window is being created).
+    """
+
+    pressed = Signal(str)  # action name
 
     def __init__(self):
         super().__init__()
-        self.callbacks: dict[int, callable] = {}
         self.failed: list[str] = []
+        self._thread = None
+        self._thread_id = 0
 
-    def register(self, combo: str, callback) -> bool:
-        try:
-            mods, vk = core.parse_hotkey(combo)
-        except ValueError as exc:
-            log.warning("%s", exc)
-            self.failed.append(combo)
-            return False
-        hotkey_id = len(self.callbacks) + 1
-        if not user32.RegisterHotKey(None, hotkey_id, mods | MOD_NOREPEAT, vk):
-            log.warning("hotkey %s is taken by another program", combo)
-            self.failed.append(combo)
-            return False
-        self.callbacks[hotkey_id] = callback
-        return True
+    def set_bindings(self, mapping: dict[str, str]):
+        """mapping: action -> combo ('ctrl+alt+s'); replaces all hotkeys, empty combos skipped."""
+        self.stop()
+        self.failed = []
+        items = [(action, combo) for action, combo in mapping.items() if combo]
+        if not items:
+            return
+        ready = threading.Event()
+        self._thread = threading.Thread(target=self._run, args=(items, ready),
+                                        name="hotkeys", daemon=True)
+        self._thread.start()
+        ready.wait(2)
 
-    def unregister_all(self):
-        for hotkey_id in self.callbacks:
+    def stop(self):
+        thread, self._thread = self._thread, None
+        if thread:
+            user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
+            thread.join(2)
+
+    def _run(self, items, ready):
+        self._thread_id = kernel32.GetCurrentThreadId()
+        actions: dict[int, str] = {}
+        for hotkey_id, (action, combo) in enumerate(items, 1):
+            try:
+                mods, vk = core.parse_hotkey(combo)
+            except ValueError as exc:
+                log.warning("%s", exc)
+                self.failed.append(combo)
+                continue
+            if user32.RegisterHotKey(None, hotkey_id, mods | MOD_NOREPEAT, vk):
+                actions[hotkey_id] = action
+            else:
+                log.warning("hotkey %s is taken by another program", combo)
+                self.failed.append(combo)
+        ready.set()  # the thread has a message queue now: stop() can reach it
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if msg.message == WM_HOTKEY:
+                action = actions.get(int(msg.wParam))
+                if action:
+                    self.pressed.emit(action)  # queued to the GUI thread
+        for hotkey_id in actions:
             user32.UnregisterHotKey(None, hotkey_id)
+
+
+# Mouse buttons as hotkeys: RegisterHotKey knows only keys, so a low-level mouse
+# hook watches the buttons. It lives in its own thread with its own message loop:
+# Windows waits for the hook on every mouse event, and the GUI thread may be busy.
+
+WH_MOUSE_LL = 14
+WM_QUIT = 0x0012
+WM_MBUTTONDOWN, WM_MBUTTONUP = 0x0207, 0x0208
+WM_XBUTTONDOWN, WM_XBUTTONUP = 0x020B, 0x020C
+LLMHF_INJECTED = 0x1
+LRESULT = ctypes.c_ssize_t
+HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+kernel32 = ctypes.windll.kernel32
+
+
+class MSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("pt", wintypes.POINT), ("mouseData", wintypes.DWORD), ("flags", wintypes.DWORD),
+                ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD]
+user32.SetWindowsHookExW.restype = wintypes.HHOOK
+user32.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+user32.CallNextHookEx.restype = LRESULT
+user32.UnhookWindowsHookEx.argtypes = [wintypes.HHOOK]
+user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+user32.GetMessageW.restype = wintypes.BOOL
+user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+user32.GetAsyncKeyState.restype = ctypes.c_short
+kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+
+
+def held_modifiers() -> int:
+    """Ctrl/Alt/Shift/Win held right now, as core.MOD_* bits."""
+    def down(vk):
+        return user32.GetAsyncKeyState(vk) & 0x8000
+    mods = 0
+    if down(0x11):
+        mods |= core.MOD_CONTROL
+    if down(0x12):
+        mods |= core.MOD_ALT
+    if down(0x10):
+        mods |= core.MOD_SHIFT
+    if down(0x5B) or down(0x5C):
+        mods |= core.MOD_WIN
+    return mods
+
+
+class MouseHotkeys(QtCore.QObject):
+    """Mouse buttons (wheel click, side buttons) with optional modifiers as global hotkeys.
+
+    A matched click is swallowed, so a side button does not also go "back" in a browser.
+    """
+
+    pressed = Signal(str)  # action name
+
+    def __init__(self):
+        super().__init__()
+        self.bindings: dict[tuple[int, str], str] = {}  # (modifiers, button) -> action
+        self.failed: list[str] = []
+        self._swallowed: set[str] = set()  # buttons whose release must be swallowed too
+        self._proc = HOOKPROC(self._hook)  # must stay referenced while the hook is set
+        self._thread = None
+        self._thread_id = 0
+        self._ready = threading.Event()
+
+    def set_bindings(self, mapping: dict[str, str]):
+        """mapping: action -> combo ('ctrl+mouse4'); empty combos are skipped."""
+        bindings, self.failed = {}, []
+        for action, combo in mapping.items():
+            if not combo:
+                continue
+            try:
+                key = core.parse_mouse(combo)
+            except ValueError as exc:
+                log.warning("%s", exc)
+                self.failed.append(combo)
+                continue
+            bindings[key] = action
+        self.bindings = bindings
+        if bindings and self._thread is None:
+            self._ready.clear()
+            self._thread = threading.Thread(target=self._run, name="mouse-hook", daemon=True)
+            self._thread.start()
+            self._ready.wait(2)
+        elif not bindings:
+            self.stop()
+
+    def stop(self):
+        thread, self._thread = self._thread, None
+        if thread:
+            user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
+            thread.join(2)
+
+    def _run(self):
+        self._thread_id = kernel32.GetCurrentThreadId()
+        hook = user32.SetWindowsHookExW(WH_MOUSE_LL, self._proc, kernel32.GetModuleHandleW(None), 0)
+        self._ready.set()
+        if not hook:
+            log.error("mouse hook failed: %s", ctypes.GetLastError())
+            return
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            pass
+        user32.UnhookWindowsHookEx(hook)
+
+    def _hook(self, code, wparam, lparam):
+        try:
+            if code == 0 and wparam in (WM_MBUTTONDOWN, WM_MBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP):
+                info = MSLLHOOKSTRUCT.from_address(lparam)
+                if not info.flags & LLMHF_INJECTED:  # leave clicks sent by programs alone
+                    if wparam in (WM_MBUTTONDOWN, WM_MBUTTONUP):
+                        button = "mouse3"
+                    else:
+                        button = "mouse4" if (info.mouseData >> 16) == 1 else "mouse5"
+                    if wparam in (WM_MBUTTONDOWN, WM_XBUTTONDOWN):
+                        action = self.bindings.get((held_modifiers(), button))
+                        if action:
+                            self._swallowed.add(button)
+                            self.pressed.emit(action)  # queued to the GUI thread
+                            return 1
+                    elif button in self._swallowed:
+                        self._swallowed.discard(button)
+                        return 1
+        except Exception:  # noqa: BLE001 - never break the mouse
+            log.exception("mouse hook")
+        return user32.CallNextHookEx(None, code, wparam, lparam)
 
     def nativeEventFilter(self, event_type, message):  # noqa: N802 - Qt name
         try:
@@ -630,7 +801,244 @@ QLineEdit:focus { border-color: #5c7cfa; }
 QScrollBar:vertical { background: transparent; width: 8px; }
 QScrollBar::handle:vertical { background: #3a4050; border-radius: 4px; min-height: 24px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QToolButton { color: #9aa3b2; background: transparent; border: none; border-radius: 4px; padding: 0 3px; }
+QToolButton:hover { background: #2c313c; color: #e6e9ef; }
+QPushButton {
+    background: #1b1e25; color: #e6e9ef; border: 1px solid #2c313c; border-radius: 6px;
+    padding: 4px 10px;
+}
+QPushButton:hover { border-color: #5c7cfa; }
+QPushButton#capturing { border-color: #5c7cfa; color: #5c7cfa; }
+QPushButton#primary { background: #3b5bdb; border-color: #3b5bdb; }
+QDialog#root { background: #14161b; }
 """
+
+# Actions that hotkeys and mouse buttons can be bound to, in the order of the settings.
+ACTIONS = {
+    "ask": "Відповідь (транскрипт + запитання)",
+    "screenshot": "Знімок екрана → Claude",
+    "focus": "Курсор у поле запитання",
+    "model": "Перемкнути модель",
+    "auto": "Голосовий режим",
+    "listen": "Пауза / слухати",
+    "clear": "Очистити",
+    "toggle": "Показати / сховати",
+    "settings": "Налаштування клавіш",
+    "quit": "Вихід",
+}
+_MODIFIER_VKS = {0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5}
+
+
+def qt_modifiers(mods) -> int:
+    """Qt keyboard modifiers -> core.MOD_* bits."""
+    m = Qt.KeyboardModifier
+    bits = 0
+    for flag, bit in ((m.ControlModifier, core.MOD_CONTROL), (m.AltModifier, core.MOD_ALT),
+                      (m.ShiftModifier, core.MOD_SHIFT), (m.MetaModifier, core.MOD_WIN)):
+        if mods & flag:
+            bits |= bit
+    return bits
+
+
+class ComboField(QtWidgets.QPushButton):
+    """Shows a hotkey; click it, then press keys (kind "key") or a mouse button ("mouse")."""
+
+    changed = Signal()
+
+    def __init__(self, kind: str, combo: str, on_info):
+        super().__init__()
+        self.kind = kind
+        self.combo = combo
+        self.capturing = False
+        self._on_info = on_info
+        self._eat_release = False
+        self.setAutoDefault(False)
+        self.setMinimumWidth(150)
+        self.clicked.connect(self.start)
+        self._show()
+
+    def set_combo(self, combo: str):
+        self.combo = combo
+        self._show()
+        self.changed.emit()
+
+    def _show(self, text: str | None = None):
+        self.setObjectName("capturing" if self.capturing else "")
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.setText(text if text is not None else (core.pretty_combo(self.combo) or "—"))
+
+    def start(self):
+        if self.capturing:
+            return
+        self.capturing = True
+        self.setFocus()
+        if self.kind == "mouse":
+            self.grabMouse()
+            self._show("Натисніть кнопку миші…")
+            self._on_info("Колесо або бічна кнопка, можна з Ctrl/Alt/Shift. "
+                          "Ліва чи права кнопка або Esc — скасувати.")
+        else:
+            self._show("Натисніть комбінацію…")
+            self._on_info("Наприклад Ctrl+Alt+S або F8. Esc — скасувати.")
+
+    def stop(self, combo: str | None = None):
+        if not self.capturing:
+            return
+        self.capturing = False
+        if self.kind == "mouse":
+            self.releaseMouse()
+        if combo is not None:
+            self.set_combo(combo)
+        else:
+            self._show()
+
+    def event(self, event):  # noqa: D401 - catch Tab and shortcuts while capturing
+        if self.capturing and event.type() == QtCore.QEvent.Type.ShortcutOverride:
+            event.accept()
+            return True
+        if self.capturing and event.type() == QtCore.QEvent.Type.KeyPress:
+            self._key(event)
+            return True
+        return super().event(event)
+
+    def _key(self, event):
+        vk = event.nativeVirtualKey()
+        mods = qt_modifiers(event.modifiers())
+        if vk == 0x1B and not mods:
+            self.stop()
+            self._on_info("")
+            return
+        if vk in _MODIFIER_VKS:
+            prefix = core.pretty_combo(core.make_combo(mods, "x"))[:-1]
+            self._show(prefix + "…")
+            return
+        if self.kind == "mouse":
+            return
+        name = core.key_name(vk)
+        if name is None:
+            self._on_info("⚠ Ця клавіша не підтримується, оберіть іншу.")
+            return
+        if not mods and core.needs_modifier(name):
+            self._on_info(f"⚠ {core.pretty_combo(name)} без Ctrl/Alt/Shift/Win заблокує цю клавішу "
+                          "в усіх програмах. Додайте модифікатор.")
+            return
+        self.stop(core.make_combo(mods, name))
+        self._on_info("")
+
+    def mousePressEvent(self, event):  # noqa: N802 - Qt name
+        if self.capturing and self.kind == "mouse":
+            self._eat_release = True
+            button = {Qt.MouseButton.MiddleButton: "mouse3", Qt.MouseButton.BackButton: "mouse4",
+                      Qt.MouseButton.ForwardButton: "mouse5"}.get(event.button())
+            mods = qt_modifiers(QtWidgets.QApplication.keyboardModifiers())
+            self.stop(core.make_combo(mods, button) if button else None)
+            self._on_info("")
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):  # noqa: N802 - Qt name
+        if self._eat_release:
+            self._eat_release = False
+            return
+        super().mouseReleaseEvent(event)
+
+    def focusOutEvent(self, event):  # noqa: N802 - Qt name
+        self.stop()
+        super().focusOutEvent(event)
+
+
+class SettingsDialog(QtWidgets.QDialog):
+    """Hotkeys and mouse buttons for every action; saved by the overlay on OK."""
+
+    def __init__(self, parent, keys: dict[str, str], mouse: dict[str, str]):
+        super().__init__(parent, Qt.WindowType.Dialog | Qt.WindowType.WindowStaysOnTopHint)
+        self.setObjectName("root")
+        self.setWindowTitle("Гарячі клавіші")
+        self.setStyleSheet(STYLE)
+        self.setFont(parent.font())
+        layout = QtWidgets.QVBoxLayout(self)
+        grid = QtWidgets.QGridLayout()
+        grid.setHorizontalSpacing(6)
+        for col, text in ((1, "Клавіатура"), (3, "Мишка")):
+            head = QtWidgets.QLabel(text)
+            head.setObjectName("title")
+            grid.addWidget(head, 0, col)
+        self.info = QtWidgets.QLabel()
+        self.info.setWordWrap(True)
+        self.fields: dict[str, tuple[ComboField, ComboField]] = {}
+        for row, (action, label) in enumerate(ACTIONS.items(), 1):
+            grid.addWidget(QtWidgets.QLabel(label), row, 0)
+            pair = []
+            for col, kind, combo in ((1, "key", keys.get(action, "")), (3, "mouse", mouse.get(action, ""))):
+                field = ComboField(kind, combo, self.info.setText)
+                field.changed.connect(self._validate)
+                clear = QtWidgets.QToolButton()
+                clear.setText("✕")
+                clear.clicked.connect(lambda _=False, f=field: f.set_combo(""))
+                grid.addWidget(field, row, col)
+                grid.addWidget(clear, row, col + 1)
+                pair.append(field)
+            self.fields[action] = tuple(pair)
+        layout.addLayout(grid)
+        layout.addWidget(self.info)
+
+        buttons = QtWidgets.QHBoxLayout()
+        defaults = QtWidgets.QPushButton("За замовчуванням")
+        defaults.setAutoDefault(False)
+        defaults.clicked.connect(self._defaults)
+        cancel = QtWidgets.QPushButton("Скасувати")
+        cancel.setAutoDefault(False)
+        cancel.clicked.connect(self.reject)
+        self.save = QtWidgets.QPushButton("Зберегти")
+        self.save.setObjectName("primary")
+        self.save.setAutoDefault(False)
+        self.save.clicked.connect(self.accept)
+        buttons.addWidget(defaults)
+        buttons.addStretch(1)
+        buttons.addWidget(cancel)
+        buttons.addWidget(self.save)
+        layout.addLayout(buttons)
+        self.info.setText("Клацніть поле й натисніть комбінацію. ✕ — прибрати.")
+        int(self.winId())  # create the native window now, to hide it from capture before showing
+        exclude_from_capture(int(self.winId()))
+
+    def showEvent(self, event):  # noqa: N802 - Qt name
+        super().showEvent(event)
+        exclude_from_capture(int(self.winId()))  # it is a separate window: a share would show it
+        self.activateWindow()
+
+    def keyPressEvent(self, event):  # noqa: N802 - Enter must not close the dialog
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            return
+        super().keyPressEvent(event)
+
+    def _defaults(self):
+        for action, (key, mouse) in self.fields.items():
+            key.set_combo(core.CONFIG["hotkeys"].get(action, ""))
+            mouse.set_combo(core.CONFIG["mouse_hotkeys"].get(action, ""))
+
+    def _validate(self):
+        problems = []
+        for index, kind in ((0, "клавіатура"), (1, "мишка")):
+            seen: dict[str, str] = {}
+            for action, pair in self.fields.items():
+                combo = pair[index].combo
+                if combo and combo in seen:
+                    problems.append(f"{core.pretty_combo(combo)} ({kind}) уже стоїть на "
+                                    f"«{ACTIONS[seen[combo]]}» і «{ACTIONS[action]}»")
+                seen.setdefault(combo, action)
+        self.save.setEnabled(not problems)
+        if problems:
+            self.info.setText("⚠ " + "; ".join(problems))
+        elif "уже стоїть" in self.info.text():
+            self.info.setText("")
+        return not problems
+
+    def result_bindings(self) -> tuple[dict[str, str], dict[str, str]]:
+        keys = {action: pair[0].combo for action, pair in self.fields.items()}
+        mouse = {action: pair[1].combo for action, pair in self.fields.items()}
+        return keys, mouse
 
 
 class QuestionField(QtWidgets.QLineEdit):
@@ -694,7 +1102,23 @@ class Overlay(QtWidgets.QWidget):
         self.pipeline.phrase.connect(self.on_phrase)
         self.pipeline.partial.connect(self.on_partial)
 
-        self.hotkeys = HotkeyFilter()
+        self.hotkeys = GlobalHotkeys()
+        self.hotkeys.pressed.connect(self.run_action)
+        self.mouse = MouseHotkeys()
+        self.mouse.pressed.connect(self.run_action)
+        self._settings_open = False
+
+    @property
+    def actions(self) -> dict:
+        return {"ask": self.ask, "screenshot": self.screenshot, "focus": self.focus_input,
+                "model": self.toggle_model, "auto": self.toggle_auto,
+                "listen": self.toggle_listening, "clear": self.clear_all,
+                "toggle": self.toggle_visible, "settings": self.open_settings, "quit": self.quit}
+
+    def run_action(self, name: str):
+        action = self.actions.get(name)
+        if action:
+            action()
 
     # ---- ui
 
@@ -715,6 +1139,12 @@ class Overlay(QtWidgets.QWidget):
         header.addWidget(title)
         header.addWidget(self.status_label, 1)
         header.addWidget(self.capture_label)
+        for icon, action in (("📷", self.screenshot), ("⚙", self.open_settings)):
+            button = QtWidgets.QToolButton()
+            button.setText(icon)
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # the question field keeps the cursor
+            button.clicked.connect(lambda _=False, a=action: a())
+            header.addWidget(button)
         layout.addLayout(header)
 
         self.transcript_view = QtWidgets.QPlainTextEdit()
@@ -749,20 +1179,14 @@ class Overlay(QtWidgets.QWidget):
         for widget in (self.transcript_view, self.answer_view, self.input):
             widget.setAcceptDrops(False)
 
-        hk = cfg["hotkeys"]
-        short = lambda combo: combo.replace("ctrl+alt+", "").upper()  # noqa: E731
         footer = QtWidgets.QHBoxLayout()
-        hint = QtWidgets.QLabel(
-            f"Ctrl+Alt + {short(hk['ask'])} відповідь · "
-            f"{short(hk['model'])} модель · "
-            f"{short(hk['auto'])} голос · {short(hk['listen'])} пауза · {short(hk['toggle'])} сховати · "
-            f"{short(hk['quit'])} вихід"
-        )
+        self.hint_label = hint = QtWidgets.QLabel()
         small = hint.font()
         small.setPointSize(max(7, int(cfg["font_size"]) - 3))
         hint.setFont(small)
         hint.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
                            QtWidgets.QSizePolicy.Policy.Preferred)
+        self._update_hint()
         footer.addWidget(hint, 1)
         footer.addWidget(QtWidgets.QSizeGrip(self))
         layout.addLayout(footer)
@@ -934,20 +1358,7 @@ class Overlay(QtWidgets.QWidget):
     def start(self):
         self.show()
         self.protect()
-        app = QtWidgets.QApplication.instance()
-        app.installNativeEventFilter(self.hotkeys)
-        hk = self.cfg["hotkeys"]
-        self.hotkeys.register(hk["ask"], self.ask)
-        self.hotkeys.register(hk["toggle"], self.toggle_visible)
-        self.hotkeys.register(hk["listen"], self.toggle_listening)
-        self.hotkeys.register(hk["auto"], self.toggle_auto)
-        self.hotkeys.register(hk["focus"], self.focus_input)
-        self.hotkeys.register(hk["clear"], self.clear_all)
-        self.hotkeys.register(hk["model"], self.toggle_model)
-        self.hotkeys.register(hk["quit"], self.quit)
-        if self.hotkeys.failed:
-            self.show_message("⚠ Ці гарячі клавіші зайняті іншою програмою: "
-                              + ", ".join(self.hotkeys.failed) + ". Змініть їх у core.py (CONFIG → hotkeys).")
+        self.apply_hotkeys()
         if not core.find_claude(self.cfg):
             self.show_message("⚠ Не знайдено Claude Code. Встановіть його та увійдіть у свій акаунт "
                               "командою `claude` у терміналі.")
@@ -964,7 +1375,84 @@ class Overlay(QtWidgets.QWidget):
         if not hidden:
             log.error("SetWindowDisplayAffinity failed; Windows 10 2004+ is required")
 
+    # ---- hotkeys and settings
+
+    def apply_hotkeys(self):
+        """(Re)register the keyboard hotkeys and mouse buttons from cfg."""
+        self.hotkeys.set_bindings({name: combo for name, combo in self.cfg["hotkeys"].items()
+                                   if name in self.actions})
+        self.mouse.set_bindings({name: combo for name, combo in self.cfg["mouse_hotkeys"].items()
+                                 if name in self.actions})
+        failed = [core.pretty_combo(c) for c in self.hotkeys.failed + self.mouse.failed]
+        if failed:
+            self.show_message("⚠ Ці гарячі клавіші зайняті іншою програмою або неправильні: "
+                              + ", ".join(failed) + ". Оберіть інші через ⚙.")
+        self._update_hint()
+
+    def _update_hint(self):
+        names = (("ask", "відповідь"), ("screenshot", "знімок"), ("model", "модель"),
+                 ("auto", "голос"), ("listen", "пауза"), ("toggle", "сховати"), ("quit", "вихід"))
+        keys, mouse = self.cfg["hotkeys"], self.cfg["mouse_hotkeys"]
+        items = [(keys.get(a) or mouse.get(a, ""), label) for a, label in names]
+        items = [(core.pretty_combo(c), label) for c, label in items if c]
+        prefix = "Ctrl+Alt+"
+        if items and all(c.startswith(prefix) for c, _ in items):
+            text = "Ctrl+Alt + " + " · ".join(f"{c[len(prefix):]} {label}" for c, label in items)
+        else:
+            text = " · ".join(f"{c} {label}" for c, label in items)
+        self.hint_label.setText((text + " · " if text else "") + "⚙ налаштувати")
+
+    def open_settings(self):
+        if self._settings_open:
+            return
+        self._settings_open = True
+        # Off while choosing: pressing a combo must not run its old action.
+        self.hotkeys.set_bindings({})
+        self.mouse.set_bindings({})
+        if not self.isVisible():
+            self.show()
+            self.protect()
+        try:
+            dialog = SettingsDialog(self, self.cfg["hotkeys"], self.cfg["mouse_hotkeys"])
+            if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+                keys, mouse = dialog.result_bindings()
+                self.cfg["hotkeys"].update(keys)
+                self.cfg["mouse_hotkeys"] = {a: c for a, c in mouse.items() if c}
+                try:
+                    core.save_settings(self.cfg)
+                except OSError as exc:
+                    self.show_message(f"⚠ Не вдалося зберегти settings.json: {exc}. "
+                                      "Клавіші діятимуть до перезапуску.")
+            dialog.deleteLater()
+        finally:
+            self._settings_open = False
+            self.apply_hotkeys()
+
     # ---- hotkey actions
+
+    def screenshot(self):
+        """Grab the screen under the mouse and send it to Claude right away, with the
+        typed question if there is one. The overlay is excluded from capture, so it
+        is not on the picture."""
+        if self._settings_open:
+            return
+        screen = (QtGui.QGuiApplication.screenAt(QtGui.QCursor.pos())
+                  or QtGui.QGuiApplication.primaryScreen())
+        image = screen.grabWindow(0).toImage()
+        if image.isNull():
+            self.show_message("⚠ Не вдалося зробити знімок екрана.")
+            return
+        longest = int(self.cfg.get("screenshot_max_side") or 0)
+        if longest and max(image.width(), image.height()) > longest:
+            # Claude scales big images down anyway; a smaller file is read faster.
+            image = image.scaled(longest, longest, Qt.AspectRatioMode.KeepAspectRatio,
+                                 Qt.TransformationMode.SmoothTransformation)
+        target = core.free_name("знімок.png")
+        if not image.save(str(target), "PNG"):
+            self.show_message("⚠ Не вдалося зберегти знімок екрана.")
+            return
+        self.attachments.append(target)
+        self.ask(screenshot=True)
 
     def toggle_visible(self):
         if self.isVisible():
@@ -1021,7 +1509,8 @@ class Overlay(QtWidgets.QWidget):
         self.runner.shutdown()
         for session_id in self.read_sessions.values():
             core.delete_session(session_id)
-        self.hotkeys.unregister_all()
+        self.hotkeys.stop()
+        self.mouse.stop()
         QtWidgets.QApplication.instance().quit()
 
     # ---- transcript
@@ -1065,7 +1554,9 @@ class Overlay(QtWidgets.QWidget):
 
     # ---- asking claude
 
-    def ask(self, question: str | None = None):
+    def ask(self, question: str | None = None, screenshot: bool = False):
+        if self._settings_open:
+            return
         if question is None:  # typed into the question field
             question = self.input.text().strip()
             self.input.clear()
@@ -1082,10 +1573,13 @@ class Overlay(QtWidgets.QWidget):
         pinned_read = (self.read_state == "ready"
                        and self.runner.resume == self.read_sessions.get(self.model))
         prompt = core.build_prompt(question, recent, history, files,
-                                   [p.name for p in self.pinned], pinned_read)
-        self.current_label = question or ("Файли" if files and not recent else "Підказка за розмовою")
+                                   [p.name for p in self.pinned], pinned_read,
+                                   screenshot=screenshot)
+        self.current_label = question or ("📷 Знімок екрана" if screenshot else
+                                          "Файли" if files and not recent else "Підказка за розмовою")
         if files:
-            self.current_label += f" 📎 {', '.join(files)}"
+            if not (screenshot and len(files) == 1 and not question):  # "📷 Знімок екрана" says it
+                self.current_label += f" 📎 {', '.join(files)}"
             self.clear_attachments()  # the copies stay on disk for Claude to read
         self.answer_text = ""
         self.waiting = True
@@ -1126,7 +1620,18 @@ class Overlay(QtWidgets.QWidget):
         bar.setValue(position)  # keep the reading position while text streams in
 
 
+def already_running() -> bool:
+    """A second overlay would fight the first over hotkeys and wipe its working folder."""
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    main.mutex = kernel32.CreateMutexW(None, False, "Local\\ai-overlay-single-instance")
+    return ctypes.GetLastError() == 183  # ERROR_ALREADY_EXISTS
+
+
 def main():
+    if already_running():
+        user32.MessageBoxW(None, "Оверлей уже запущений. Закрийте його (Ctrl+Alt+Q) перед новим "
+                           "запуском.", "AI overlay", 0x40)
+        return
     cfg = core.load_config()
     app = QtWidgets.QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
