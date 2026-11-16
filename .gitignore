@@ -5,3 +5,4 @@ __pycache__/
 *.log
 settings.json
 .venv-mac/
+mac/overlay-guard
