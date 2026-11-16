@@ -386,6 +386,7 @@ class Transcriber:
         self.device = "cpu"
         self._loaded = None       # set once start_loading() runs
         self._load_error = None
+        self.on_ready = None      # called when the model is swapped (CPU bridge -> GPU)
 
     def start_loading(self):
         """Begin load() in the background now, so it overlaps with the UI coming up.
@@ -412,59 +413,98 @@ class Transcriber:
         if self._load_error is not None:
             raise self._load_error
 
+    @staticmethod
+    def _build(model_name, device, compute_type):
+        from faster_whisper import WhisperModel
+        # local_files_only skips a network check against huggingface (~1.5 s once the model
+        # is cached); the first run ever has no cache, so then download it.
+        try:
+            return WhisperModel(model_name, device=device, compute_type=compute_type,
+                                local_files_only=True)
+        except Exception:  # noqa: BLE001 - not in the cache yet: fetch it
+            return WhisperModel(model_name, device=device, compute_type=compute_type)
+
+    @staticmethod
+    def _warm(model):
+        # First transcribe: pays the one-time CUDA kernel init and surfaces a missing
+        # CUDA/cuDNN DLL. A GPU model costs ~2 s here; the tiny CPU bridge almost nothing.
+        segments, _ = model.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), language="en")
+        list(segments)
+
+    def _use(self, model, device, model_name):
+        self.model, self.device = model, device
+        self.description = f"{model_name} ({device})"
+
     def load(self):
         add_nvidia_dll_dirs()
-        from faster_whisper import WhisperModel
-
         name = self.cfg["whisper_model"]
         want = self.cfg["whisper_device"]
-        candidates = []
+        gpu = None
         if want in ("auto", "cuda") and self._cuda_available():
-            candidates.append(("cuda", self.cfg.get("whisper_compute_type") or "int8_float16",
-                               "large-v3-turbo" if name == "auto" else name))
-        candidates.append(("cpu", "int8", "small" if name == "auto" else name))
+            gpu = ("large-v3-turbo" if name == "auto" else name, "cuda",
+                   self.cfg.get("whisper_compute_type") or "int8_float16")
 
-        last_error = None
-        for i, (device, compute_type, model_name) in enumerate(candidates):
+        # Auto mode on a GPU: start on a small CPU model so speech works in ~1-2 s instead
+        # of ~8 s, then upgrade to the GPU model (which loads in the background). The first
+        # seconds are low quality on any model, so the weaker bridge costs almost nothing.
+        if gpu and name == "auto":
             try:
-                # local_files_only skips a network check against huggingface (~1.5 s once the
-                # model is cached); the first run ever has no cache, so then download it.
-                try:
-                    model = WhisperModel(model_name, device=device, compute_type=compute_type,
-                                         local_files_only=True)
-                except Exception:  # noqa: BLE001 - not in the cache yet: fetch it
-                    model = WhisperModel(model_name, device=device, compute_type=compute_type)
-            except Exception as exc:  # noqa: BLE001 - this model would not even build: try the next
+                bridge = self._build("base", "cpu", "int8")
+                self._warm(bridge)
+                self._use(bridge, "cpu", "base")
+                self.description = "base (cpu) · вантажу large-v3-turbo…"
+                threading.Thread(target=self._upgrade, args=(gpu,),
+                                 name="whisper-upgrade", daemon=True).start()
+                return
+            except Exception as exc:  # noqa: BLE001 - bridge failed: load the real model directly
+                self.log(f"Whisper CPU bridge failed, loading directly: {exc!r}")
+
+        candidates = []
+        if gpu:
+            candidates.append(gpu)
+        candidates.append(("small" if name == "auto" else name, "cpu", "int8"))
+        last_error = None
+        for i, (model_name, device, compute_type) in enumerate(candidates):
+            try:
+                model = self._build(model_name, device, compute_type)
+            except Exception as exc:  # noqa: BLE001 - would not even build: try the next
                 last_error = exc
                 self.log(f"Whisper {model_name} on {device} failed to build: {exc!r}")
                 continue
-            self.model, self.device = model, device
-            self.description = f"{model_name} ({device})"
-            # The model is usable now. The warm-up (first transcribe) only pays the one-time
-            # CUDA kernel init (~2 s) and surfaces a missing CUDA/cuDNN DLL; keep it off the
-            # critical path so "ready" shows ~2 s sooner. The first real phrase runs seconds
-            # behind speech anyway, so paying the init there is invisible. If the warm-up
-            # fails (broken CUDA), fall back to the remaining candidates (CPU).
+            self._use(model, device, model_name)
+            # Warm up off the critical path, so "ready" shows ~2 s sooner; a broken CUDA
+            # falls back to the remaining (CPU) candidates from this thread.
             threading.Thread(target=self._warm_up, args=(model, candidates[i + 1:]),
                              name="whisper-warmup", daemon=True).start()
             return
         raise RuntimeError(f"could not load a Whisper model: {last_error!r}")
 
+    def _upgrade(self, gpu):
+        """Load the GPU model while the CPU bridge handles speech, then swap it in."""
+        model_name, device, compute_type = gpu
+        try:
+            model = self._build(model_name, device, compute_type)
+            self._warm(model)  # fully ready before the swap, so the first GPU phrase is fast
+        except Exception as exc:  # noqa: BLE001 - GPU never came up: keep the CPU bridge
+            self.log(f"Whisper GPU upgrade failed, staying on CPU: {exc!r}")
+            return
+        self._use(model, device, model_name)
+        if self.on_ready:
+            self.on_ready()
+
     def _warm_up(self, model, fallback):
         try:
-            segments, _ = model.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), language="en")
-            list(segments)
+            self._warm(model)
             return
         except Exception as exc:  # noqa: BLE001
             self.log(f"Whisper warm-up failed on {self.device}: {exc!r}")
-        from faster_whisper import WhisperModel
-        for device, compute_type, model_name in fallback:
+        for model_name, device, compute_type in fallback:
             try:
-                alt = WhisperModel(model_name, device=device, compute_type=compute_type)
-                segments, _ = alt.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), language="en")
-                list(segments)
-                self.model, self.device = alt, device
-                self.description = f"{model_name} ({device})"
+                alt = self._build(model_name, device, compute_type)
+                self._warm(alt)
+                self._use(alt, device, model_name)
+                if self.on_ready:
+                    self.on_ready()
                 return
             except Exception as exc:  # noqa: BLE001
                 self.log(f"Whisper fallback {model_name} on {device} failed: {exc!r}")
