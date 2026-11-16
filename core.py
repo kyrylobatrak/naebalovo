@@ -49,6 +49,9 @@ CONFIG = {
     "language": "uk",             # "uk", "en", ... or None to detect per phrase
     "listen_mic": True,           # your voice
     "listen_system": True,        # what plays in speakers/headphones (the other side)
+    # macOS cannot record the speakers by itself: system sound comes from a virtual
+    # device such as BlackHole (see mac/README.md); this is part of its name.
+    "mac_system_device": "BlackHole",
     "auto_answer_mic": False,     # send every finished phrase of yours to Claude
     "silence_sec": 0.5,           # pause that ends a phrase
     "max_segment_sec": 8.0,       # longest phrase before a forced cut
@@ -179,6 +182,8 @@ for _name, _vk in _KEYS.items():
 _SOLO_KEYS = {"insert", "pause", "scrolllock", "printscreen"}
 
 MOUSE_BUTTONS = {"mouse3": "Колесо (клік)", "mouse4": "Бічна 1", "mouse5": "Бічна 2"}
+# How modifiers are shown; macOS shows "alt" as Option and "win" as Cmd.
+MOD_LABELS = {"ctrl": "Ctrl", "alt": "Alt", "shift": "Shift", "win": "Win"}
 
 
 def _split_combo(text: str) -> tuple[int, list[str]]:
@@ -241,7 +246,7 @@ def pretty_combo(text: str) -> str:
     if not text:
         return ""
     mods, rest = _split_combo(text)
-    names = [name.capitalize() for name, bit in _MOD_ORDER if mods & bit]
+    names = [MOD_LABELS[name] for name, bit in _MOD_ORDER if mods & bit]
     for part in rest:
         if part in MOUSE_BUTTONS:
             names.append(MOUSE_BUTTONS[part])
@@ -491,8 +496,10 @@ def find_claude(cfg: dict) -> str | None:
     found = shutil.which("claude")
     if found:
         return found
-    for candidate in (Path.home() / ".local" / "bin" / "claude.exe",
-                      Path.home() / ".claude" / "local" / "claude.exe"):
+    exe = ".exe" if os.name == "nt" else ""
+    for candidate in (Path.home() / ".local" / "bin" / f"claude{exe}",
+                      Path.home() / ".claude" / "local" / f"claude{exe}",
+                      Path("/opt/homebrew/bin/claude"), Path("/usr/local/bin/claude")):
         if candidate.exists():
             return str(candidate)
     return None

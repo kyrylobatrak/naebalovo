@@ -1,0 +1,10 @@
+PySide6-Essentials>=6.6
+numpy
+faster-whisper>=1.1.0
+sounddevice>=0.4.6
+pypdf>=4
+ziamath>=0.13
+edge-tts>=7
+pyobjc-framework-Cocoa>=10
+pyobjc-framework-Quartz>=10
+pyobjc-framework-ApplicationServices>=10

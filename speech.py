@@ -207,12 +207,57 @@ class _Tempo:
         return np.concatenate(out) if out else np.zeros(0, np.float32)
 
 
-def _pyaudio():
-    try:
-        import pyaudiowpatch as pyaudio  # Windows build used by the overlay
-    except ImportError:
-        import pyaudio
-    return pyaudio
+class _Output:
+    """Default speakers, opened anew for every play (they may have changed).
+    PyAudio on Windows (the overlay has it already); sounddevice elsewhere,
+    since its macOS wheels bring their own PortAudio."""
+
+    def __init__(self):
+        self._pa = self._stream = self._sd = None
+        try:
+            import pyaudiowpatch as pyaudio
+        except ImportError:
+            pyaudio = None
+        if pyaudio is not None:
+            self._pa = pyaudio.PyAudio()
+            try:
+                self._stream = self._pa.open(format=pyaudio.paFloat32, channels=1, rate=RATE,
+                                             output=True, frames_per_buffer=BLOCK)
+            except Exception:
+                self._pa.terminate()
+                raise
+        else:
+            import sounddevice as sd
+            self._sd = sd.OutputStream(samplerate=RATE, channels=1, dtype="float32",
+                                       blocksize=BLOCK)
+            self._sd.start()
+
+    def write(self, block: np.ndarray):
+        block = np.ascontiguousarray(block, dtype=np.float32)
+        if self._sd is not None:
+            self._sd.write(block.reshape(-1, 1))
+        else:
+            self._stream.write(block.tobytes(), len(block))
+
+    def drain(self):
+        """Wait until what is buffered has played."""
+        if self._sd is not None:
+            self._sd.stop()
+        else:
+            self._stream.stop_stream()
+
+    def close(self):
+        """Drops what is still buffered: pause is immediate."""
+        try:
+            if self._sd is not None:
+                self._sd.abort()
+                self._sd.close()
+            else:
+                self._stream.close()
+        except Exception:  # noqa: BLE001
+            pass
+        if self._pa is not None:
+            self._pa.terminate()
 
 
 class Speaker:
@@ -425,19 +470,13 @@ class Speaker:
         return self._tempo.process(source), "play"
 
     def _play_loop(self):
-        pyaudio = pa = stream = None
+        stream = None
 
         def close_stream():
-            nonlocal pa, stream
+            nonlocal stream
             if stream is not None:
-                try:
-                    stream.close()  # drops what is still buffered: pause is immediate
-                except Exception:  # noqa: BLE001
-                    pass
+                stream.close()
                 stream = None
-            if pa is not None:
-                pa.terminate()  # the next play opens the default device anew
-                pa = None
 
         while True:
             with self._cond:
@@ -450,7 +489,7 @@ class Speaker:
             if what in ("end", "paused"):
                 if what == "end" and stream is not None:
                     try:
-                        stream.stop_stream()  # let the last words in the buffer play out
+                        stream.drain()  # let the last words in the buffer play out
                     except Exception:  # noqa: BLE001
                         pass
                     self._last_sound = time.monotonic()
@@ -466,11 +505,8 @@ class Speaker:
                 continue
             try:
                 if stream is None:
-                    pyaudio = pyaudio or _pyaudio()
-                    pa = pyaudio.PyAudio()
-                    stream = pa.open(format=pyaudio.paFloat32, channels=1, rate=RATE,
-                                     output=True, frames_per_buffer=BLOCK)
-                stream.write(block.astype(np.float32).tobytes(), len(block))
+                    stream = _Output()
+                stream.write(block)
                 self._last_sound = time.monotonic()
             except Exception as exc:  # noqa: BLE001 - no output device, device unplugged
                 self._log("audio output failed: %r", exc)
