@@ -68,6 +68,7 @@ try:
 
     import core
     import mathview
+    import speech
 except Exception:  # noqa: BLE001
     fatal("Не вдалося імпортувати залежності. Запустіть run.bat або "
           "pip install -r requirements.txt\n\n" + traceback.format_exc())
@@ -382,6 +383,9 @@ class Pipeline(QtCore.QObject):
         self._partial_len: dict[str, int] = {}     # phrase length at the last draft
         self._partial_shown: dict[str, bool] = {}  # a draft is on screen
         self._sources_info = ""
+        # True while the overlay reads an answer aloud: the loopback (and a microphone
+        # near the speakers) would hear that voice and Whisper would write it down.
+        self.speaking = lambda: False
 
     def start(self):
         threading.Thread(target=self._run, name="pipeline", daemon=True).start()
@@ -531,8 +535,13 @@ class Pipeline(QtCore.QObject):
             channels = int(info["maxInputChannels"])
             rate = int(info["defaultSampleRate"])
 
+            mute_while_speaking = source == "system" or self.cfg.get("tts_mute_mic", True)
+
             def callback(in_data, frame_count, time_info, status_flags):
-                self.frames.put((source, in_data, channels, rate))
+                # Dropped when recorded, not when recognized: Whisper runs seconds behind,
+                # and by then the voice may have stopped.
+                if not (mute_while_speaking and self.speaking()):
+                    self.frames.put((source, in_data, channels, rate))
                 return None, pyaudio.paContinue
 
             stream = pa.open(
@@ -810,6 +819,9 @@ QPushButton {
 QPushButton:hover { border-color: #5c7cfa; }
 QPushButton#capturing { border-color: #5c7cfa; color: #5c7cfa; }
 QPushButton#primary { background: #3b5bdb; border-color: #3b5bdb; }
+QSlider::groove:horizontal { height: 4px; background: #2c313c; border-radius: 2px; }
+QSlider::sub-page:horizontal { background: #5c7cfa; border-radius: 2px; }
+QSlider::handle:horizontal { background: #e6e9ef; width: 10px; margin: -4px 0; border-radius: 5px; }
 QDialog#root { background: #14161b; }
 """
 
@@ -824,6 +836,12 @@ ACTIONS = {
     "clear": "Очистити",
     "toggle": "Показати / сховати",
     "settings": "Налаштування клавіш",
+    "speak": "Озвучити відповідь / пауза",
+    "speak_back": "Озвучення: назад",
+    "speak_forward": "Озвучення: вперед",
+    "speak_slower": "Озвучення: повільніше",
+    "speak_faster": "Озвучення: швидше",
+    "speak_stop": "Озвучення: стоп",
     "quit": "Вихід",
 }
 _MODIFIER_VKS = {0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5}
@@ -1082,12 +1100,15 @@ class Overlay(QtWidgets.QWidget):
         self.current_label = ""
         self.answer_text = ""
         self.waiting = False
+        self.answer_done = True
+        self.spoken_request = -1  # the request whose answer the speaker holds
         self.attachments: list[Path] = []  # files for the next question, copied into ATTACH_DIR
         self.pinned: list[Path] = []       # files for every question of this session, also there
         self._models = (str(cfg["claude_model"]), str(cfg.get("claude_model_alt") or "sonnet"))
         self.read_sessions: dict[str, str] = {}  # model -> session in which it read these files
         self.read_state = ""               # for the current model: "", "reading", "ready", "error"
         core.reset_attach_dir()            # also the working folder of Claude Code
+        self.speaker = speech.Speaker(cfg, log=log.warning)
 
         self._build_ui()
         self.setAcceptDrops(True)
@@ -1101,6 +1122,7 @@ class Overlay(QtWidgets.QWidget):
         self.pipeline.status.connect(self.status_label.setText)
         self.pipeline.phrase.connect(self.on_phrase)
         self.pipeline.partial.connect(self.on_partial)
+        self.pipeline.speaking = self.speaker.audible
 
         self.hotkeys = GlobalHotkeys()
         self.hotkeys.pressed.connect(self.run_action)
@@ -1113,12 +1135,19 @@ class Overlay(QtWidgets.QWidget):
         return {"ask": self.ask, "screenshot": self.screenshot, "focus": self.focus_input,
                 "model": self.toggle_model, "auto": self.toggle_auto,
                 "listen": self.toggle_listening, "clear": self.clear_all,
-                "toggle": self.toggle_visible, "settings": self.open_settings, "quit": self.quit}
+                "toggle": self.toggle_visible, "settings": self.open_settings, "quit": self.quit,
+                "speak": self.speak, "speak_stop": self.speaker.stop,
+                "speak_back": lambda: self.seek_speech(-1),
+                "speak_forward": lambda: self.seek_speech(1),
+                "speak_slower": lambda: self.change_speech_speed(-0.25),
+                "speak_faster": lambda: self.change_speech_speed(0.25)}
 
     def run_action(self, name: str):
         action = self.actions.get(name)
         if action:
             action()
+            if name.startswith("speak"):
+                self._update_player()
 
     # ---- ui
 
@@ -1157,6 +1186,7 @@ class Overlay(QtWidgets.QWidget):
         self.answer_view.setOpenLinks(False)
         self.answer_view.setPlaceholderText("Відповідь Claude")
         layout.addWidget(self.answer_view, 1)
+        layout.addLayout(self._build_player())
 
         self.pinned_label = QtWidgets.QLabel()
         self.pinned_label.setWordWrap(True)
@@ -1198,6 +1228,95 @@ class Overlay(QtWidgets.QWidget):
         self.resize(int(cfg["width"]), int(cfg["height"]))
         screen = QtGui.QGuiApplication.primaryScreen().availableGeometry()
         self.move(screen.right() - self.width() - 24, screen.top() + 24)
+
+    def _build_player(self) -> QtWidgets.QHBoxLayout:
+        """▶ ⏪ ⏩ ⏹, position slider, time and speed for reading the answer aloud."""
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(2)
+
+        def button(text, slot):
+            b = QtWidgets.QToolButton()
+            b.setText(text)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.setAutoRepeat(text in ("⏪", "⏩"))  # hold to keep seeking
+            b.clicked.connect(lambda _=False: (slot(), self._update_player()))
+            row.addWidget(b)
+            return b
+
+        self.play_button = button("▶", self.speak)
+        button("⏪", lambda: self.seek_speech(-1))
+        button("⏩", lambda: self.seek_speech(1))
+        button("⏹", self.speaker.stop)
+        self.player_slider = QtWidgets.QSlider(Qt.Orientation.Horizontal)
+        self.player_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.player_slider.setSingleStep(1000)
+        self.player_slider.setPageStep(int(float(self.cfg.get("tts_seek_sec") or 5) * 1000))
+        # Dragging moves only the handle; the voice jumps on release.
+        self.player_slider.setTracking(False)
+        self.player_slider.valueChanged.connect(lambda ms: self.speaker.seek_to(ms / 1000))
+        row.addWidget(self.player_slider, 1)
+        self.player_time = QtWidgets.QLabel()
+        row.addWidget(self.player_time)
+        button("−", lambda: self.change_speech_speed(-0.25))
+        self.speed_label = QtWidgets.QLabel()
+        row.addWidget(self.speed_label)
+        button("+", lambda: self.change_speech_speed(0.25))
+        self._player_timer = QtCore.QTimer(self, interval=150)
+        self._player_timer.timeout.connect(self._update_player)
+        self._update_player()
+        return row
+
+    # ---- reading aloud
+
+    def speak(self):
+        """Read the answer on screen aloud; again = pause / go on."""
+        if self.spoken_request == self.current_request and self.speaker.state()["has_audio"]:
+            self.speaker.toggle()
+        elif self.answer_text.strip() and not self.answer_text.startswith("⚠"):
+            self.spoken_request = self.current_request
+            self.speaker.speak(self.answer_text, final=self.answer_done or not self.current_request)
+        else:
+            self.player_time.setText("немає відповіді")
+            return
+        self._player_timer.start()
+
+    def seek_speech(self, direction: int):
+        self.speaker.seek(direction * float(self.cfg.get("tts_seek_sec") or 5))
+
+    def change_speech_speed(self, step: float):
+        self.cfg["tts_speed"] = self.speaker.change_speed(step)
+        try:
+            core.save_settings(self.cfg)
+        except OSError:
+            log.exception("save settings")
+
+    def _update_player(self):
+        state = self.speaker.state()
+        self.play_button.setText("⏸" if state["playing"] else "▶")
+        self.speed_label.setText(f"{state['speed']:g}×")
+        if not self.player_slider.isSliderDown():
+            self.player_slider.blockSignals(True)
+            self.player_slider.setRange(0, int(state["duration"] * 1000))
+            self.player_slider.setValue(int(state["position"] * 1000))
+            self.player_slider.blockSignals(False)
+
+        def clock(sec):
+            return f"{int(sec) // 60}:{int(sec) % 60:02d}"
+
+        if state["error"]:
+            text = "⚠ " + state["error"]
+        elif state["loading"]:
+            text = "⏳ озвучую…"
+        elif state["has_audio"]:
+            total = clock(state["duration"]) + ("" if state["complete"] else "+")
+            text = f"{clock(state['position'])} / {total}"
+        else:
+            text = ""
+        self.player_time.setText(text)
+        if not state["playing"] and state["complete"]:
+            self._player_timer.stop()
+        elif not self._player_timer.isActive():
+            self._player_timer.start()
 
     # ---- attachments
 
@@ -1390,7 +1509,8 @@ class Overlay(QtWidgets.QWidget):
         self._update_hint()
 
     def _update_hint(self):
-        names = (("ask", "відповідь"), ("screenshot", "знімок"), ("model", "модель"),
+        names = (("ask", "відповідь"), ("screenshot", "знімок"), ("speak", "озвучити"),
+                 ("model", "модель"),
                  ("auto", "голос"), ("listen", "пауза"), ("toggle", "сховати"), ("quit", "вихід"))
         keys, mouse = self.cfg["hotkeys"], self.cfg["mouse_hotkeys"]
         items = [(keys.get(a) or mouse.get(a, ""), label) for a, label in names]
@@ -1504,8 +1624,11 @@ class Overlay(QtWidgets.QWidget):
         self.transcript_view.clear()
         self.answer_view.clear()
         self.answer_text = ""
+        self.speaker.stop()
+        self._update_player()
 
     def quit(self):
+        self.speaker.close()
         self.runner.shutdown()
         for session_id in self.read_sessions.values():
             core.delete_session(session_id)
@@ -1583,6 +1706,9 @@ class Overlay(QtWidgets.QWidget):
             self.clear_attachments()  # the copies stay on disk for Claude to read
         self.answer_text = ""
         self.waiting = True
+        self.answer_done = False
+        self.speaker.stop()
+        self._update_player()
         self.current_request = self.runner.ask(prompt)
         self.render_answer()
         if not self.isVisible():
@@ -1595,13 +1721,21 @@ class Overlay(QtWidgets.QWidget):
         self.waiting = False
         self.answer_text += text
         self.render_answer(streaming=True)
+        if self.spoken_request == request_id:
+            self.speaker.update(self.answer_text, final=False)
 
     def on_done(self, request_id: int, answer: str, is_error: bool):
         if request_id != self.current_request:
             return
         self.waiting = False
+        self.answer_done = True
         self.answer_text = ("⚠ " + answer) if is_error else answer
         self.render_answer()
+        if self.spoken_request == request_id:
+            if is_error:
+                self.speaker.stop()
+            else:
+                self.speaker.update(self.answer_text, final=True)
         if not is_error:
             self.history.append((self.current_label, answer))
 

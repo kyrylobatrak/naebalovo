@@ -4,6 +4,7 @@ faster-whisper>=1.1.0
 PyAudioWPatch>=0.2.12.6
 pypdf>=4
 ziamath>=0.13
+edge-tts>=7
 
 # Optional, for an NVIDIA GPU (large-v3-turbo in real time):
 #   pip install nvidia-cublas-cu12 "nvidia-cudnn-cu12==9.*"
