@@ -434,15 +434,7 @@ class Transcriber:
                                          local_files_only=True)
                 except Exception:  # noqa: BLE001 - not in the cache yet: fetch it
                     model = WhisperModel(model_name, device=device, compute_type=compute_type)
-                # Warm up synchronously, BEFORE the model takes real audio. The first
-                # inference on a freshly loaded CUDA model can come out garbled (cuDNN picks
-                # its kernels on the first pass); absorbing that here on silence means the
-                # first real phrase is already clean. Warming with the real language primes
-                # the exact decode path, and it also surfaces a missing CUDA/cuDNN DLL so we
-                # can fall back to CPU.
-                segments, _ = model.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32),
-                                               language=self.cfg.get("language") or "en")
-                list(segments)
+                self._warm_up(model, device)
                 self.model, self.device = model, device
                 self.description = f"{model_name} ({device})"
                 return
@@ -450,6 +442,22 @@ class Transcriber:
                 last_error = exc
                 self.log(f"Whisper {model_name} on {device} failed: {exc!r}")
         raise RuntimeError(f"could not load a Whisper model: {last_error!r}")
+
+    def _warm_up(self, model, device):
+        """Run the full transcribe path, BEFORE the model takes real audio, so the first
+        real phrase is not the first inference. The first pass on a fresh CUDA model comes
+        out garbled (cuDNN picks its kernels on the first real decode). Warming on silence
+        is not enough: silence decodes to nothing, so the decoder's autoregressive kernels
+        never run. Use noise so the decoder actually generates tokens, match the real
+        language/beam, and make one vad_filter=True pass so the VAD model loads here too.
+        Also surfaces a missing CUDA/cuDNN DLL so load() can fall back to CPU."""
+        lang = self.cfg.get("language") or "en"
+        beam = int(self.cfg.get("beam_size") or (5 if device == "cuda" else 1))
+        noise = (0.05 * np.random.randn(3 * SAMPLE_RATE)).astype(np.float32)
+        for vad in (False, False, True):
+            segments, _ = model.transcribe(noise, language=lang, beam_size=beam,
+                                           vad_filter=vad, condition_on_previous_text=False)
+            list(segments)
 
     @staticmethod
     def _cuda_available() -> bool:
