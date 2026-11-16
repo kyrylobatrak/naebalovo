@@ -812,6 +812,7 @@ QScrollBar::handle:vertical { background: #3a4050; border-radius: 4px; min-heigh
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QToolButton { color: #9aa3b2; background: transparent; border: none; border-radius: 4px; padding: 0 3px; }
 QToolButton:hover { background: #2c313c; color: #e6e9ef; }
+QToolButton:checked { color: #5c7cfa; font-weight: 600; }
 QPushButton {
     background: #1b1e25; color: #e6e9ef; border: 1px solid #2c313c; border-radius: 6px;
     padding: 4px 10px;
@@ -842,6 +843,7 @@ ACTIONS = {
     "speak_slower": "Озвучення: повільніше",
     "speak_faster": "Озвучення: швидше",
     "speak_stop": "Озвучення: стоп",
+    "speak_auto": "Авто-озвучення вкл / викл",
     "quit": "Вихід",
 }
 _MODIFIER_VKS = {0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5}
@@ -1137,6 +1139,7 @@ class Overlay(QtWidgets.QWidget):
                 "listen": self.toggle_listening, "clear": self.clear_all,
                 "toggle": self.toggle_visible, "settings": self.open_settings, "quit": self.quit,
                 "speak": self.speak, "speak_stop": self.speaker.stop,
+                "speak_auto": self.toggle_auto_speech,
                 "speak_back": lambda: self.seek_speech(-1),
                 "speak_forward": lambda: self.seek_speech(1),
                 "speak_slower": lambda: self.change_speech_speed(-0.25),
@@ -1261,6 +1264,9 @@ class Overlay(QtWidgets.QWidget):
         self.speed_label = QtWidgets.QLabel()
         row.addWidget(self.speed_label)
         button("+", lambda: self.change_speech_speed(0.25))
+        self.auto_button = button("авто", self.toggle_auto_speech)
+        self.auto_button.setCheckable(True)
+        self.auto_button.setChecked(bool(self.cfg.get("tts_auto")))
         self._player_timer = QtCore.QTimer(self, interval=150)
         self._player_timer.timeout.connect(self._update_player)
         self._update_player()
@@ -1283,8 +1289,17 @@ class Overlay(QtWidgets.QWidget):
     def seek_speech(self, direction: int):
         self.speaker.seek(direction * float(self.cfg.get("tts_seek_sec") or 5))
 
+    def toggle_auto_speech(self):
+        """Auto mode on/off: every new answer is read aloud as it streams in."""
+        self.cfg["tts_auto"] = not self.cfg.get("tts_auto")
+        self.auto_button.setChecked(self.cfg["tts_auto"])  # highlighted while on
+        self._save_settings()
+
     def change_speech_speed(self, step: float):
         self.cfg["tts_speed"] = self.speaker.change_speed(step)
+        self._save_settings()
+
+    def _save_settings(self):
         try:
             core.save_settings(self.cfg)
         except OSError:
@@ -1723,6 +1738,15 @@ class Overlay(QtWidgets.QWidget):
         self.render_answer(streaming=True)
         if self.spoken_request == request_id:
             self.speaker.update(self.answer_text, final=False)
+        elif self.cfg.get("tts_auto"):
+            self._auto_speak(request_id, final=False)
+
+    def _auto_speak(self, request_id: int, final: bool):
+        """Auto mode: read the answer while it is still being written. The first
+        sentence is synthesized as soon as it is finished."""
+        self.spoken_request = request_id
+        self.speaker.speak(self.answer_text, final=final)
+        self._update_player()
 
     def on_done(self, request_id: int, answer: str, is_error: bool):
         if request_id != self.current_request:
@@ -1736,6 +1760,8 @@ class Overlay(QtWidgets.QWidget):
                 self.speaker.stop()
             else:
                 self.speaker.update(self.answer_text, final=True)
+        elif self.cfg.get("tts_auto") and not is_error:  # the answer came in one piece
+            self._auto_speak(request_id, final=True)
         if not is_error:
             self.history.append((self.current_label, answer))
 

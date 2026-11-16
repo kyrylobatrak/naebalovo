@@ -106,15 +106,27 @@ def speech_text(markdown: str) -> str:
     return re.sub(r"\s+", " ", " ".join(lines)).strip()
 
 
+def _closed(text: str) -> bool:
+    """No code block, $$ formula or $ formula is left open at the end of text."""
+    return (text.count("```") % 2 == 0 and text.count("$$") % 2 == 0
+            and text.replace("$$", "").count("$") % 2 == 0)
+
+
+# Where a streaming answer may be cut: a paragraph break or the end of a sentence.
+_BOUNDARY = re.compile(r"\n[ \t]*\n|(?<=[.!?…])[ \t]+(?=\S)|(?<=[.!?…:])\n")
+_LIST_MARK = re.compile(r"(?:^|\n)[ \t]*(?:\d+|[-*+•])[.)]?$")  # "1." of a list is no sentence
+
+
 def next_piece(text: str, start: int, final: bool) -> tuple[str, int] | None:
-    """The finished part of a streaming answer after `start`: whole paragraphs that are
-    not inside a code block or a $$ formula. Returns (piece, new start) or None."""
+    """The finished part of a streaming answer after `start`: up to the last finished
+    sentence or paragraph that is not inside code or a formula, so the voice can start
+    with the first sentence. Returns (piece, new start) or None."""
     rest = text[start:]
     if final:
         return (rest, len(text)) if rest.strip() else None
-    for match in reversed(list(re.finditer(r"\n[ \t]*\n", rest))):
+    for match in reversed(list(_BOUNDARY.finditer(rest))):
         head = rest[:match.start()]
-        if head.count("```") % 2 == 0 and head.count("$$") % 2 == 0:
+        if _closed(head) and not _LIST_MARK.search(head):
             return (head, start + match.end()) if head.strip() else None
     return None
 
@@ -274,6 +286,8 @@ class Speaker:
     def update(self, text: str, final: bool):
         """The streaming answer grew (or ended): read the new paragraphs too."""
         with self._cond:
+            if self._synth_done:  # stopped (or all read): nothing to add to
+                return
             if text.startswith(self._text[:self._taken]):
                 self._text = text
             else:
@@ -476,9 +490,9 @@ class Speaker:
                     self._cond.wait_for(lambda: self._playing or self._closed)
                 continue
             if what == "wait":
-                with self._cond:
-                    self._cond.wait(0.05)
-                continue
+                # The next sentence is still being synthesized: play silence meanwhile,
+                # so the device is open and Bluetooth headphones are awake when it comes.
+                block = np.zeros(BLOCK, np.float32)
             if not len(block):
                 continue
             try:

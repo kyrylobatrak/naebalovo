@@ -61,6 +61,7 @@ CONFIG = {
     # --- reading answers aloud (edge-tts: Microsoft neural voices, needs internet) ---
     "tts_voice": "uk-UA-PolinaNeural",   # or uk-UA-OstapNeural; list: edge-tts --list-voices
     "tts_voice_en": "en-US-AvaNeural",   # for answers that are mostly in English ("" = same voice)
+    "tts_auto": True,                    # read every answer aloud as it streams in ("авто")
     "tts_speed": 1.0,                    # 0.5-3.0; the overlay's −/+ change it and save it
     "tts_seek_sec": 5,                   # how far ⏪ / ⏩ jump
     # While the answer is read aloud the overlay does not listen to the speakers; with
@@ -89,6 +90,7 @@ CONFIG = {
         "speak_slower": "ctrl+alt+down",
         "speak_faster": "ctrl+alt+up",
         "speak_stop": "",
+        "speak_auto": "",             # auto reading of answers on / off
         "quit": "ctrl+alt+q",
     },
     # Mouse buttons for the same actions: "mouse3" (wheel click), "mouse4", "mouse5"
@@ -145,13 +147,16 @@ def load_config() -> dict:
                                  if action in CONFIG["hotkeys"] and isinstance(combo, str)})
     if isinstance(saved, dict) and isinstance(saved.get("tts_speed"), (int, float)):
         cfg["tts_speed"] = float(saved["tts_speed"])
+    if isinstance(saved, dict) and isinstance(saved.get("tts_auto"), bool):
+        cfg["tts_auto"] = saved["tts_auto"]
     return cfg
 
 
 def save_settings(cfg: dict):
-    """Keep the hotkeys and reading speed chosen in the overlay for the next start."""
+    """Keep the hotkeys and reading settings chosen in the overlay for the next start."""
     data = {section: dict(cfg[section]) for section in ("hotkeys", "mouse_hotkeys")}
     data["tts_speed"] = cfg["tts_speed"]
+    data["tts_auto"] = bool(cfg.get("tts_auto"))
     SETTINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
