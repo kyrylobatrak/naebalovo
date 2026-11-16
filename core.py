@@ -425,7 +425,7 @@ class Transcriber:
         candidates.append(("cpu", "int8", "small" if name == "auto" else name))
 
         last_error = None
-        for i, (device, compute_type, model_name) in enumerate(candidates):
+        for device, compute_type, model_name in candidates:
             try:
                 # local_files_only skips a network check against huggingface (~1.5 s once the
                 # model is cached); the first run ever has no cache, so then download it.
@@ -434,40 +434,22 @@ class Transcriber:
                                          local_files_only=True)
                 except Exception:  # noqa: BLE001 - not in the cache yet: fetch it
                     model = WhisperModel(model_name, device=device, compute_type=compute_type)
-            except Exception as exc:  # noqa: BLE001 - this model would not even build: try the next
-                last_error = exc
-                self.log(f"Whisper {model_name} on {device} failed to build: {exc!r}")
-                continue
-            self.model, self.device = model, device
-            self.description = f"{model_name} ({device})"
-            # The model is usable now. The warm-up (first transcribe) only pays the one-time
-            # CUDA kernel init (~2 s) and surfaces a missing CUDA/cuDNN DLL; keep it off the
-            # critical path so "ready" shows ~2 s sooner. The first real phrase runs seconds
-            # behind speech anyway, so paying the init there is invisible. If the warm-up
-            # fails (broken CUDA), fall back to the remaining candidates (CPU).
-            threading.Thread(target=self._warm_up, args=(model, candidates[i + 1:]),
-                             name="whisper-warmup", daemon=True).start()
-            return
-        raise RuntimeError(f"could not load a Whisper model: {last_error!r}")
-
-    def _warm_up(self, model, fallback):
-        try:
-            segments, _ = model.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), language="en")
-            list(segments)
-            return
-        except Exception as exc:  # noqa: BLE001
-            self.log(f"Whisper warm-up failed on {self.device}: {exc!r}")
-        from faster_whisper import WhisperModel
-        for device, compute_type, model_name in fallback:
-            try:
-                alt = WhisperModel(model_name, device=device, compute_type=compute_type)
-                segments, _ = alt.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), language="en")
+                # Warm up synchronously, BEFORE the model takes real audio. The first
+                # inference on a freshly loaded CUDA model can come out garbled (cuDNN picks
+                # its kernels on the first pass); absorbing that here on silence means the
+                # first real phrase is already clean. Warming with the real language primes
+                # the exact decode path, and it also surfaces a missing CUDA/cuDNN DLL so we
+                # can fall back to CPU.
+                segments, _ = model.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32),
+                                               language=self.cfg.get("language") or "en")
                 list(segments)
-                self.model, self.device = alt, device
+                self.model, self.device = model, device
                 self.description = f"{model_name} ({device})"
                 return
-            except Exception as exc:  # noqa: BLE001
-                self.log(f"Whisper fallback {model_name} on {device} failed: {exc!r}")
+            except Exception as exc:  # noqa: BLE001 - try the next candidate
+                last_error = exc
+                self.log(f"Whisper {model_name} on {device} failed: {exc!r}")
+        raise RuntimeError(f"could not load a Whisper model: {last_error!r}")
 
     @staticmethod
     def _cuda_available() -> bool:
