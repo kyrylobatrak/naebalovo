@@ -14,6 +14,7 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 from collections import deque
@@ -383,6 +384,33 @@ class Transcriber:
         self.model = None
         self.description = ""
         self.device = "cpu"
+        self._loaded = None       # set once start_loading() runs
+        self._load_error = None
+
+    def start_loading(self):
+        """Begin load() in the background now, so it overlaps with the UI coming up.
+        Idempotent: the first caller wins, later ones do nothing."""
+        if self._loaded is not None:
+            return
+        self._loaded = threading.Event()
+
+        def work():
+            try:
+                self.load()
+            except Exception as exc:  # noqa: BLE001 - re-raised in wait_loaded()
+                self._load_error = exc
+            finally:
+                self._loaded.set()
+
+        threading.Thread(target=work, name="whisper-load", daemon=True).start()
+
+    def wait_loaded(self):
+        """Block until the background load() finishes; raise if it failed."""
+        if self._loaded is None:
+            self.start_loading()
+        self._loaded.wait()
+        if self._load_error is not None:
+            raise self._load_error
 
     def load(self):
         add_nvidia_dll_dirs()
@@ -397,19 +425,49 @@ class Transcriber:
         candidates.append(("cpu", "int8", "small" if name == "auto" else name))
 
         last_error = None
-        for device, compute_type, model_name in candidates:
+        for i, (device, compute_type, model_name) in enumerate(candidates):
             try:
-                model = WhisperModel(model_name, device=device, compute_type=compute_type)
-                # Warm-up: a missing CUDA/cuDNN DLL only shows up on the first run.
-                segments, _ = model.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), language="en")
+                # local_files_only skips a network check against huggingface (~1.5 s once the
+                # model is cached); the first run ever has no cache, so then download it.
+                try:
+                    model = WhisperModel(model_name, device=device, compute_type=compute_type,
+                                         local_files_only=True)
+                except Exception:  # noqa: BLE001 - not in the cache yet: fetch it
+                    model = WhisperModel(model_name, device=device, compute_type=compute_type)
+            except Exception as exc:  # noqa: BLE001 - this model would not even build: try the next
+                last_error = exc
+                self.log(f"Whisper {model_name} on {device} failed to build: {exc!r}")
+                continue
+            self.model, self.device = model, device
+            self.description = f"{model_name} ({device})"
+            # The model is usable now. The warm-up (first transcribe) only pays the one-time
+            # CUDA kernel init (~2 s) and surfaces a missing CUDA/cuDNN DLL; keep it off the
+            # critical path so "ready" shows ~2 s sooner. The first real phrase runs seconds
+            # behind speech anyway, so paying the init there is invisible. If the warm-up
+            # fails (broken CUDA), fall back to the remaining candidates (CPU).
+            threading.Thread(target=self._warm_up, args=(model, candidates[i + 1:]),
+                             name="whisper-warmup", daemon=True).start()
+            return
+        raise RuntimeError(f"could not load a Whisper model: {last_error!r}")
+
+    def _warm_up(self, model, fallback):
+        try:
+            segments, _ = model.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), language="en")
+            list(segments)
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"Whisper warm-up failed on {self.device}: {exc!r}")
+        from faster_whisper import WhisperModel
+        for device, compute_type, model_name in fallback:
+            try:
+                alt = WhisperModel(model_name, device=device, compute_type=compute_type)
+                segments, _ = alt.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), language="en")
                 list(segments)
-                self.model, self.device = model, device
+                self.model, self.device = alt, device
                 self.description = f"{model_name} ({device})"
                 return
-            except Exception as exc:  # noqa: BLE001 - try the next candidate
-                last_error = exc
-                self.log(f"Whisper {model_name} on {device} failed: {exc!r}")
-        raise RuntimeError(f"could not load a Whisper model: {last_error!r}")
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"Whisper fallback {model_name} on {device} failed: {exc!r}")
 
     @staticmethod
     def _cuda_available() -> bool:

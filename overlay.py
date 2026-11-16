@@ -96,12 +96,14 @@ class Pipeline(QtCore.QObject):
     phrase = Signal(str, str)     # source ("mic" / "system"), final text of a phrase
     partial = Signal(str, str)    # source, draft of the phrase being spoken ("" = remove)
 
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, transcriber=None):
         super().__init__()
         self.cfg = cfg
         self.frames: queue.Queue = queue.Queue()
         self.listening = True
-        self.transcriber = core.Transcriber(cfg, log=log.warning)
+        # The model may already be loading (started in main() before the window was built).
+        self.transcriber = transcriber or core.Transcriber(cfg, log=log.warning)
+        self.transcriber.start_loading()
         self._audio = None  # what system.open_audio returned
         self._device_ids = ("", "")
         self._partial_len: dict[str, int] = {}     # phrase length at the last draft
@@ -122,7 +124,7 @@ class Pipeline(QtCore.QObject):
     def _run(self):
         try:
             self.status.emit("Завантажую модель Whisper (перший запуск завантажує її з інтернету)…")
-            self.transcriber.load()
+            self.transcriber.wait_loaded()  # started already; this only waits for it to finish
             self._open_audio()
         except Exception as exc:  # noqa: BLE001
             log.exception("pipeline start")
@@ -861,7 +863,7 @@ TRANSCRIPT_HEIGHT = 92  # the transcript's height when it is not squeezed or fol
 
 
 class Overlay(QtWidgets.QWidget):
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, transcriber=None):
         super().__init__(
             None,
             Qt.WindowType.FramelessWindowHint
@@ -869,6 +871,7 @@ class Overlay(QtWidgets.QWidget):
             | Qt.WindowType.Tool,  # no taskbar button, not in Alt+Tab
         )
         self.cfg = cfg
+        self._transcriber = transcriber
         self.setObjectName("root")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
@@ -905,7 +908,7 @@ class Overlay(QtWidgets.QWidget):
         self.runner.done.connect(self.on_done)
         self.runner.files_read.connect(self.on_files_read)
 
-        self.pipeline = Pipeline(cfg)
+        self.pipeline = Pipeline(cfg, self._transcriber)
         self.pipeline.status.connect(self.status_label.setText)
         self.pipeline.phrase.connect(self.on_phrase)
         self.pipeline.partial.connect(self.on_partial)
@@ -1656,11 +1659,15 @@ def main():
                            + (f" ({quit_key})" if quit_key else "") + " перед новим запуском.")
         return
     cfg = core.load_config()
+    # Start loading Whisper right away, so it runs while Qt starts and the window is
+    # built — the model is ready sooner after the overlay is (re)started.
+    transcriber = core.Transcriber(cfg, log=log.warning)
+    transcriber.start_loading()
     system.before_app()
     app = QtWidgets.QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     system.prepare_app(app)
-    window = Overlay(cfg)
+    window = Overlay(cfg, transcriber)
     window.start()
     sys.exit(app.exec())
 
