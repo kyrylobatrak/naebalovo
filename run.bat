@@ -13,7 +13,11 @@ if not exist ".venv\Scripts\pythonw.exe" (
 rem New PDFs in Lectures become Markdown with LaTeX formulas (about a minute each,
 rem only once); the overlay pins those instead of the PDFs.
 ".venv\Scripts\python.exe" pdf_to_markdown.py
-start "" ".venv\Scripts\pythonw.exe" overlay.py
+rem overlay-guard.exe starts the overlay and puts it on a mouse button
+rem (mouse5 = side "forward"; mouse4 = side "back", mouse3 = wheel click):
+rem press = stop the overlay and all its processes / start it again,
+rem Ctrl+press = stop everything and the guard. Source: native\overlay_guard.cpp
+start "" "overlay-guard.exe" mouse5
 exit /b 0
 
 :error
