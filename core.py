@@ -76,6 +76,8 @@ CONFIG = {
     "width": 540,
     "height": 460,
     "font_size": 11,
+    "files_folded": False,        # the list of files under the answer is folded (overlay saves it)
+    "transcript_folded": False,   # the transcript above the answer is folded (overlay saves it)
     # Defaults; the ⚙ button of the overlay changes them and saves to settings.json.
     "hotkeys": {
         "ask": "ctrl+alt+enter",      # answer from the transcript (+ typed question)
@@ -150,8 +152,9 @@ def load_config() -> dict:
                                  if action in CONFIG["hotkeys"] and isinstance(combo, str)})
     if isinstance(saved, dict) and isinstance(saved.get("tts_speed"), (int, float)):
         cfg["tts_speed"] = float(saved["tts_speed"])
-    if isinstance(saved, dict) and isinstance(saved.get("tts_auto"), bool):
-        cfg["tts_auto"] = saved["tts_auto"]
+    for key in ("tts_auto", "files_folded", "transcript_folded"):
+        if isinstance(saved, dict) and isinstance(saved.get(key), bool):
+            cfg[key] = saved[key]
     return cfg
 
 
@@ -160,6 +163,8 @@ def save_settings(cfg: dict):
     data = {section: dict(cfg[section]) for section in ("hotkeys", "mouse_hotkeys")}
     data["tts_speed"] = cfg["tts_speed"]
     data["tts_auto"] = bool(cfg.get("tts_auto"))
+    data["files_folded"] = bool(cfg.get("files_folded"))
+    data["transcript_folded"] = bool(cfg.get("transcript_folded"))
     SETTINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 

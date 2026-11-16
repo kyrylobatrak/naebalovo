@@ -489,6 +489,7 @@ QScrollBar::handle:vertical { background: #3a4050; border-radius: 4px; min-heigh
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QToolButton { color: #9aa3b2; background: transparent; border: none; border-radius: 4px; padding: 0 3px; }
 QToolButton:hover { background: #2c313c; color: #e6e9ef; }
+QScrollArea#files, QWidget#files { background: transparent; }
 QToolButton:checked { color: #5c7cfa; font-weight: 600; }
 QPushButton {
     background: #1b1e25; color: #e6e9ef; border: 1px solid #2c313c; border-radius: 6px;
@@ -736,6 +737,112 @@ class SettingsDialog(QtWidgets.QDialog):
         return keys, mouse
 
 
+class FoldHandle(QtWidgets.QSplitterHandle):
+    """The strip between two parts of the window: drag it to make the foldable part
+    smaller, down to nothing; click it to fold or unfold. Folded, it says what is hidden."""
+
+    def __init__(self, orientation, splitter):
+        super().__init__(orientation, splitter)
+        self.setCursor(Qt.CursorShape.SplitVCursor)
+        self._press_y = None
+
+    def paintEvent(self, event):  # noqa: N802 - Qt name
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        splitter = self.splitter()
+        if splitter.folded():
+            font = painter.font()
+            font.setPointSize(max(7, font.pointSize() - 2))
+            painter.setFont(font)
+            painter.setPen(QtGui.QColor("#9aa3b2"))
+            text = QtGui.QFontMetrics(font).elidedText(
+                f"{splitter.arrow} {splitter.summary()}", Qt.TextElideMode.ElideRight,
+                self.width() - 16)
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, text)
+        else:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QtGui.QColor("#3a4050"))
+            painter.drawRoundedRect(QtCore.QRectF(self.width() / 2 - 20, self.height() / 2 - 1.5,
+                                                  40, 3), 1.5, 1.5)
+
+    def mousePressEvent(self, event):  # noqa: N802 - Qt name
+        self._press_y = event.position().y()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):  # noqa: N802 - Qt name
+        super().mouseReleaseEvent(event)
+        if self._press_y is not None and abs(event.position().y() - self._press_y) < 3:
+            self.splitter().toggle_fold()  # a click, not a drag
+        self._press_y = None
+
+
+class FoldSplitter(QtWidgets.QSplitter):
+    """Two parts one above the other; one of them (the transcript, the list of files)
+    can be squeezed or folded away to give the answer more room."""
+
+    folded_changed = Signal(bool)
+
+    def __init__(self, fold_index: int, summary, natural_height):
+        super().__init__(Qt.Orientation.Vertical)
+        self.fold_index = fold_index          # 0 = the upper part folds, 1 = the lower one
+        self.arrow = "▾" if fold_index == 0 else "▴"  # where to drag to open it
+        self.summary = summary                # () -> text on the folded handle
+        self.natural_height = natural_height  # () -> height of the part when unfolded
+        self.setHandleWidth(14)
+        self.setChildrenCollapsible(False)
+        self._open_height = 0                 # height of the part before it was folded
+        self._was_folded = False
+        self.splitterMoved.connect(lambda *_: self._moved())
+
+    def createHandle(self):  # noqa: N802 - Qt name
+        return FoldHandle(self.orientation(), self)
+
+    def add(self, upper, lower):
+        self.addWidget(upper)
+        self.addWidget(lower)
+        other = 1 - self.fold_index
+        self.setCollapsible(self.fold_index, True)  # dragged all the way, the part disappears
+        self.setCollapsible(other, False)
+        self.setStretchFactor(self.fold_index, 0)
+        self.setStretchFactor(other, 1)
+
+    def folded(self) -> bool:
+        return self.sizes()[self.fold_index] == 0
+
+    def _set_part(self, height: int):
+        sizes = self.sizes()
+        total = sum(sizes)
+        height = max(0, min(height, total))
+        sizes[self.fold_index] = height
+        sizes[1 - self.fold_index] = total - height
+        self.setSizes(sizes)
+
+    def fold(self, folded: bool):
+        part = self.sizes()[self.fold_index]
+        if folded and part:
+            self._open_height = part
+            self._set_part(0)
+        elif not folded and not part:
+            self._set_part(self._open_height or self.natural_height())
+        self._moved()
+
+    def toggle_fold(self):
+        self.fold(not self.folded())
+
+    def fit(self):
+        """Give the part its natural height (unless it is folded)."""
+        if not self.folded():
+            self._set_part(self.natural_height())
+        self._moved()
+
+    def _moved(self):
+        self.handle(1).update()
+        folded = self.folded()
+        if folded != self._was_folded:
+            self._was_folded = folded
+            self.folded_changed.emit(folded)
+
+
 class QuestionField(QtWidgets.QLineEdit):
     """Question input; Ctrl+V of a copied file or picture attaches it instead of pasting text."""
 
@@ -748,6 +855,9 @@ class QuestionField(QtWidgets.QLineEdit):
             if self._on_paste(QtWidgets.QApplication.clipboard().mimeData()):
                 return
         super().keyPressEvent(event)
+
+
+TRANSCRIPT_HEIGHT = 92  # the transcript's height when it is not squeezed or folded
 
 
 class Overlay(QtWidgets.QWidget):
@@ -856,27 +966,58 @@ class Overlay(QtWidgets.QWidget):
 
         self.transcript_view = QtWidgets.QPlainTextEdit()
         self.transcript_view.setReadOnly(True)
-        self.transcript_view.setFixedHeight(92)
         self.transcript_view.setPlaceholderText("Тут з'являтиметься транскрипт розмови")
-        layout.addWidget(self.transcript_view)
 
         self.answer_view = mathview.AnswerView()  # draws LaTeX formulas
         self.answer_view.setOpenLinks(False)
         self.answer_view.setPlaceholderText("Відповідь Claude")
-        layout.addWidget(self.answer_view, 1)
-        layout.addLayout(self._build_player())
+        answer_box = QtWidgets.QWidget()
+        answer_layout = QtWidgets.QVBoxLayout(answer_box)
+        answer_layout.setContentsMargins(0, 0, 0, 0)
+        answer_layout.setSpacing(6)
+        answer_layout.addWidget(self.answer_view, 1)
+        answer_layout.addLayout(self._build_player())
 
         self.pinned_label = QtWidgets.QLabel()
         self.pinned_label.setWordWrap(True)
         self.pinned_label.linkActivated.connect(self._on_pinned_link)
         self.pinned_label.hide()
-        layout.addWidget(self.pinned_label)
-
         self.attach_label = QtWidgets.QLabel()
         self.attach_label.setWordWrap(True)
         self.attach_label.linkActivated.connect(self._on_attach_link)
         self.attach_label.hide()
-        layout.addWidget(self.attach_label)
+        files_list = QtWidgets.QWidget()
+        files_list.setObjectName("files")
+        files_layout = QtWidgets.QVBoxLayout(files_list)
+        files_layout.setContentsMargins(0, 0, 4, 0)
+        files_layout.setSpacing(4)
+        files_layout.addWidget(self.pinned_label)
+        files_layout.addWidget(self.attach_label)
+        files_layout.addStretch(1)
+        # Squeezed by the handle, a long list scrolls instead of being cut off.
+        self.files_panel = QtWidgets.QScrollArea()
+        self.files_panel.setObjectName("files")
+        self.files_panel.setWidgetResizable(True)
+        self.files_panel.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.files_panel.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.files_panel.setWidget(files_list)
+        self.files_panel.hide()
+
+        self.files_splitter = FoldSplitter(1, self._files_summary, self._files_height)
+        self.files_splitter.add(answer_box, self.files_panel)
+        self.files_splitter.folded_changed.connect(
+            lambda folded: self._remember_fold("files_folded", folded))
+
+        self.transcript_splitter = FoldSplitter(0, self._transcript_summary,
+                                                lambda: TRANSCRIPT_HEIGHT)
+        self.transcript_splitter.add(self.transcript_view, self.files_splitter)
+        self.transcript_splitter.folded_changed.connect(
+            lambda folded: self._remember_fold("transcript_folded", folded))
+        layout.addWidget(self.transcript_splitter, 1)
+        # Sizes are known once the window is shown.
+        QtCore.QTimer.singleShot(0, lambda: self.transcript_splitter.fold(True)
+                                 if self.cfg.get("transcript_folded")
+                                 else self.transcript_splitter.fit())
 
         self.input = QuestionField(self.attach_mime)
         self.input.setPlaceholderText("Запитання… Enter — надіслати · файл: перетягніть або Ctrl+V")
@@ -1051,12 +1192,57 @@ class Overlay(QtWidgets.QWidget):
     def _update_attach_label(self):
         if not self.attachments:
             self.attach_label.hide()
+            self._update_files_panel()
             return
         names = ", ".join(p.name for p in self.attachments)
         self.attach_label.setText(f"📎 {html.escape(names)} · "
                                   f"<a href='pin' style='color:#9aa3b2'>на всю сесію</a> · "
                                   f"<a href='clear' style='color:#9aa3b2'>прибрати</a>")
         self.attach_label.show()
+        self._update_files_panel()
+
+    # ---- list of files under the answer (folds away to give the answer more room)
+
+    def _files_summary(self) -> str:
+        parts = []
+        if self.pinned:
+            parts.append(f"📌 {len(self.pinned)}")
+        if self.attachments:
+            parts.append(f"📎 {len(self.attachments)}")
+        return " · ".join(parts) + " · файли згорнуто"
+
+    def _update_files_panel(self):
+        """Show the list while there are files, sized to them; hide it with the handle
+        when there are none."""
+        has_files = bool(self.pinned or self.attachments)
+        if not has_files:
+            self.files_panel.hide()
+            return
+        first_time = self.files_panel.isHidden()
+        self.files_panel.show()
+        if first_time and self.cfg.get("files_folded"):
+            QtCore.QTimer.singleShot(0, lambda: self.files_splitter.fold(True))
+        else:
+            QtCore.QTimer.singleShot(0, self.files_splitter.fit)  # after the labels are laid out
+        self.files_splitter.handle(1).update()
+
+    def _files_height(self) -> int:
+        """Height that shows the whole list, but never more than a third of the space."""
+        content = self.files_panel.widget().sizeHint().height() + 4
+        return max(24, min(content, max(60, sum(self.files_splitter.sizes()) // 3)))
+
+    def _remember_fold(self, key: str, folded: bool):
+        if self.cfg.get(key) != folded:
+            self.cfg[key] = folded
+            self._save_settings()
+
+    def _transcript_summary(self) -> str:
+        lines = self.transcript_view.toPlainText().strip().splitlines()
+        return "транскрипт згорнуто" + (f" · {lines[-1]}" if lines else "")
+
+    def _transcript_changed(self):
+        if self.transcript_splitter.folded():  # the folded handle shows the last phrase
+            self.transcript_splitter.handle(1).update()
 
     def _on_attach_link(self, link: str):
         if link == "pin":
@@ -1139,6 +1325,7 @@ class Overlay(QtWidgets.QWidget):
     def _update_pinned_label(self):
         if not self.pinned:
             self.pinned_label.hide()
+            self._update_files_panel()
             return
         links = ", ".join(f"<a href='unpin:{i}' style='color:#d7dbe3;text-decoration:none'>"
                           f"{html.escape(p.name)} ✕</a>" for i, p in enumerate(self.pinned))
@@ -1147,6 +1334,7 @@ class Overlay(QtWidgets.QWidget):
         self.pinned_label.setText(f"📌 {links}{state} · "
                                   f"<a href='unpin:all' style='color:#9aa3b2'>відкріпити всі</a>")
         self.pinned_label.show()
+        self._update_files_panel()
 
     def _on_pinned_link(self, link: str):
         which = link.partition(":")[2]
@@ -1316,6 +1504,7 @@ class Overlay(QtWidgets.QWidget):
         self._partial_lines = 0
         self.clear_attachments()
         self.transcript_view.clear()
+        self._transcript_changed()
         self.answer_view.clear()
         self.answer_text = ""
         self.speaker.stop()
@@ -1368,6 +1557,7 @@ class Overlay(QtWidgets.QWidget):
         for source, text in self.partials.items():
             self.transcript_view.appendPlainText(f"{core.SOURCE_LABELS.get(source, source)}: {text} …")
             self._partial_lines += 1
+        self._transcript_changed()
 
     # ---- asking claude
 

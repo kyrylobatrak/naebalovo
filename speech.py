@@ -26,6 +26,7 @@ BLOCK = 1200          # samples written at a time: 50 ms, the delay of pause and
 SPEEDS = (0.5, 3.0)   # slowest and fastest speed
 GROUP_CHARS = 260     # sentences are synthesized in groups about this long
 PARALLEL = 3          # groups synthesized at the same time
+HEDGE_AFTER = 1.2     # seconds without an answer before the same request is sent again
 
 
 # ------------------------------------------------------------ text to speak
@@ -114,6 +115,9 @@ def _closed(text: str) -> bool:
 
 # Where a streaming answer may be cut: a paragraph break or the end of a sentence.
 _BOUNDARY = re.compile(r"\n[ \t]*\n|(?<=[.!?…])[ \t]+(?=\S)|(?<=[.!?…:])\n")
+# A clause inside a sentence: after , ; : or before a dash.
+_CLAUSE = re.compile(r"(?<=[,;:])[ \t]+(?=\S)|[ \t]+(?=[—–][ \t])")
+FIRST_CLAUSE_CHARS = 30  # the shortest first clause worth starting the voice with
 _LIST_MARK = re.compile(r"(?:^|\n)[ \t]*(?:\d+|[-*+•])[.)]?$")  # "1." of a list is no sentence
 
 
@@ -128,6 +132,12 @@ def next_piece(text: str, start: int, final: bool) -> tuple[str, int] | None:
         head = rest[:match.start()]
         if _closed(head) and not _LIST_MARK.search(head):
             return (head, start + match.end()) if head.strip() else None
+    if start == 0:
+        # The first sentence of an answer is often long: start with its first clause.
+        for match in reversed(list(_CLAUSE.finditer(rest))):
+            head = rest[:match.start()]
+            if len(head.strip()) >= FIRST_CLAUSE_CHARS and _closed(head):
+                return head, start + match.end()
     return None
 
 
@@ -185,7 +195,17 @@ def decode_mp3(data: bytes) -> np.ndarray:
                 parts.append(out.to_ndarray().reshape(-1))
         for out in resampler.resample(None):
             parts.append(out.to_ndarray().reshape(-1))
-    return np.concatenate(parts).astype(np.float32) if parts else np.zeros(0, np.float32)
+    pcm = np.concatenate(parts).astype(np.float32) if parts else np.zeros(0, np.float32)
+    return trim_silence(pcm)
+
+
+def trim_silence(pcm: np.ndarray, lead: float = 0.03, tail: float = 0.25) -> np.ndarray:
+    """edge-tts puts ~0.2 s of silence before and ~0.95 s after every piece: the voice
+    started late and paused for a second between sentences. Keep a short natural pause."""
+    loud = np.nonzero(np.abs(pcm) > 0.01)[0]
+    if not len(loud):
+        return pcm[:0]
+    return pcm[max(0, loud[0] - int(lead * RATE)):loud[-1] + int(tail * RATE)]
 
 
 class _Tempo:
@@ -311,6 +331,15 @@ class Speaker:
         self.error = ""
         self.speed = min(max(float(cfg.get("tts_speed") or 1.0), SPEEDS[0]), SPEEDS[1])
         threading.Thread(target=self._play_loop, name="speaker", daemon=True).start()
+        threading.Thread(target=self._warm_up, name="tts-warm-up", daemon=True).start()
+
+    def _warm_up(self):
+        """The first synthesis of a process is ~1 s slower (imports, TLS, the service's
+        token): do one with a fixed word at start, not with the first answer."""
+        try:
+            decode_mp3(asyncio.run(self._synthesize("Так.")))
+        except Exception as exc:  # noqa: BLE001 - offline now: the first answer will tell
+            self._log("text to speech warm-up failed: %r", exc)
 
     # ---- control
 
@@ -422,12 +451,31 @@ class Speaker:
         async with limit:
             for attempt in (1, 2):
                 try:
-                    pcm = decode_mp3(await self._synthesize(text))
+                    pcm = decode_mp3(await self._hedged(text))
                     if len(pcm):
                         return pcm
                 except Exception as exc:  # noqa: BLE001 - no internet, service hiccup, ...
                     self._log("text to speech failed (try %d): %r", attempt, exc)
             return None
+
+    async def _hedged(self, text: str) -> bytes:
+        """The service usually answers in ~0.8 s but now and then hangs for 2-4 s:
+        if it is slow, ask a second time and take whichever answer comes first."""
+        first = asyncio.ensure_future(self._synthesize(text))
+        done, _ = await asyncio.wait({first}, timeout=HEDGE_AFTER)
+        if done:
+            return first.result()
+        tasks = {first, asyncio.ensure_future(self._synthesize(text))}
+        try:
+            while tasks:
+                done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    if task.exception() is None:
+                        return task.result()
+            return first.result()  # both failed: raise the first error
+        finally:
+            for task in tasks:
+                task.cancel()
 
     async def _produce(self, gen: int):
         """Sends the answer to synthesis as it streams in, several groups at once, and glues
