@@ -124,8 +124,6 @@ class Pipeline(QtCore.QObject):
     def _run(self):
         try:
             self.status.emit("Завантажую модель Whisper (перший запуск завантажує її з інтернету)…")
-            # Update the header when the CPU bridge is swapped for the GPU model.
-            self.transcriber.on_ready = lambda: self.status.emit(self.describe())
             self.transcriber.wait_loaded()  # started already; this only waits for it to finish
             self._open_audio()
         except Exception as exc:  # noqa: BLE001
