@@ -215,6 +215,23 @@ def _pyaudio():
     return pyaudio
 
 
+def _sound_mapper(pa, pyaudio) -> int | None:
+    """Windows "Microsoft Sound Mapper - Output": Windows sends it to the default
+    device as it is when the stream opens. PortAudio's own default is the one from
+    when PortAudio started, and the transcription keeps PortAudio running, so
+    headphones plugged in later would stay silent while the voice went to the speakers.
+    PortAudio lists the mapper first among the MME outputs."""
+    try:
+        mme = pa.get_host_api_info_by_type(pyaudio.paMME)
+        for k in range(mme["deviceCount"]):
+            info = pa.get_device_info_by_host_api_device_index(mme["index"], k)
+            if info["maxOutputChannels"] > 0:
+                return int(info["index"])
+    except Exception:  # noqa: BLE001 - no MME: PortAudio's default device
+        pass
+    return None
+
+
 class Speaker:
     """Synthesizes an answer in the background and plays it; every method is thread-safe."""
 
@@ -469,7 +486,11 @@ class Speaker:
                     pyaudio = pyaudio or _pyaudio()
                     pa = pyaudio.PyAudio()
                     stream = pa.open(format=pyaudio.paFloat32, channels=1, rate=RATE,
-                                     output=True, frames_per_buffer=BLOCK)
+                                     output=True, frames_per_buffer=BLOCK,
+                                     output_device_index=_sound_mapper(pa, pyaudio))
+                    # Bluetooth headphones wake up on the first sound and lose it.
+                    silence = np.zeros(RATE // 4, np.float32)
+                    stream.write(silence.tobytes(), len(silence))
                 stream.write(block.astype(np.float32).tobytes(), len(block))
                 self._last_sound = time.monotonic()
             except Exception as exc:  # noqa: BLE001 - no output device, device unplugged
