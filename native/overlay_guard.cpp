@@ -4,6 +4,9 @@
 //                     overlay stopped -> start it again
 //   Ctrl + press      end the overlay and this program
 //
+// It also delivers the overlay's own mouse hotkeys (settings.json "mouse_hotkeys"),
+// see overlay_mouse_window() below.
+//
 // The overlay runs inside a job object of this program, so everything it starts
 // (Claude Code, node, their children) is in the job too and dies with it. The
 // button is watched by a low-level mouse hook here, outside Python: it works
@@ -22,6 +25,10 @@
 namespace {
 
 constexpr UINT WM_GUARD_PRESS = WM_APP + 1;  // wParam: 1 if Ctrl was held
+// To the overlay's window: wParam = button (3/4/5), lParam = modifiers. Keep in sync
+// with windows.py (MouseHotkeys).
+constexpr UINT WM_OVERLAY_MOUSE = WM_APP + 2;
+const wchar_t* const kOverlayMouseClass = L"AiOverlayMouseSink";
 const wchar_t* const kTitle = L"AI overlay guard";
 
 DWORD g_main_thread = 0;
@@ -42,6 +49,45 @@ int button_of(WPARAM message, const MSLLHOOKSTRUCT* info) {
     }
 }
 
+// Same bits as core.MOD_* and RegisterHotKey's MOD_*.
+int held_modifiers() {
+    auto down = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+    int mods = 0;
+    if (down(VK_MENU)) mods |= MOD_ALT;
+    if (down(VK_CONTROL)) mods |= MOD_CONTROL;
+    if (down(VK_SHIFT)) mods |= MOD_SHIFT;
+    if (down(VK_LWIN) || down(VK_RWIN)) mods |= MOD_WIN;
+    return mods;
+}
+
+// The overlay's own mouse buttons. A low-level hook in Python would hold up every
+// mouse event in the system while Python is busy, so the overlay has no hook: it
+// keeps a message-only window whose title lists its bindings ("ai-overlay-mouse:4.0,3.2"
+// = button.modifiers), and this hook posts the matching presses to it. PostMessage
+// never waits, so a busy or hung overlay cannot freeze the mouse.
+HWND overlay_mouse_window(int button, int mods) {
+    HWND hwnd = FindWindowExW(HWND_MESSAGE, nullptr, kOverlayMouseClass, nullptr);
+    if (!hwnd) return nullptr;
+    wchar_t title[256];
+    // For another process's window this reads the stored title, it sends no message.
+    if (!GetWindowTextW(hwnd, title, 256)) return nullptr;
+    const wchar_t* p = wcschr(title, L':');
+    while (p && *p) {
+        ++p;  // past ':' or ','
+        wchar_t* end = nullptr;
+        long b = wcstol(p, &end, 10);
+        if (end == p || *end != L'.') return nullptr;
+        p = end + 1;
+        long m = wcstol(p, &end, 10);
+        if (end == p) return nullptr;
+        if (b == button && m == mods) return hwnd;
+        p = wcschr(end, L',');
+    }
+    return nullptr;
+}
+
+bool g_overlay_swallowed[6] = {};  // a press went to the overlay: swallow its release too
+
 LRESULT CALLBACK mouse_hook(int code, WPARAM wparam, LPARAM lparam) {
     if (code == HC_ACTION) {
         auto* info = reinterpret_cast<MSLLHOOKSTRUCT*>(lparam);
@@ -50,13 +96,26 @@ LRESULT CALLBACK mouse_hook(int code, WPARAM wparam, LPARAM lparam) {
 #else
         bool real = !(info->flags & LLMHF_INJECTED);  // clicks sent by programs do not
 #endif
-        if (real && button_of(wparam, info) == g_button) {
-            if (wparam == WM_MBUTTONDOWN || wparam == WM_XBUTTONDOWN) {
+        int button = real ? button_of(wparam, info) : 0;
+        bool press = wparam == WM_MBUTTONDOWN || wparam == WM_XBUTTONDOWN;
+        if (button && button == g_button) {
+            if (press) {
                 bool ctrl = GetAsyncKeyState(VK_CONTROL) & 0x8000;
                 // The work happens in the message loop: a hook must return at once.
                 PostThreadMessageW(g_main_thread, WM_GUARD_PRESS, ctrl ? 1 : 0, 0);
             }
             return 1;  // swallow the press and its release
+        }
+        if (button && press) {
+            int mods = held_modifiers();
+            if (HWND hwnd = overlay_mouse_window(button, mods)) {
+                PostMessageW(hwnd, WM_OVERLAY_MOUSE, button, mods);
+                g_overlay_swallowed[button] = true;
+                return 1;
+            }
+        } else if (button && g_overlay_swallowed[button]) {
+            g_overlay_swallowed[button] = false;
+            return 1;
         }
     }
     return CallNextHookEx(nullptr, code, wparam, lparam);

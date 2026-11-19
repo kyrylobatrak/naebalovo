@@ -165,94 +165,109 @@ class GlobalHotkeys(QtCore.QObject):
             user32.UnregisterHotKey(None, hotkey_id)
 
 
-# Mouse buttons as hotkeys: RegisterHotKey knows only keys, so a low-level mouse
-# hook watches the buttons. It lives in its own thread with its own message loop:
-# Windows waits for the hook on every mouse event, and the GUI thread may be busy.
+# Mouse buttons as hotkeys. RegisterHotKey knows only keys, and a low-level mouse
+# hook in Python is dangerous: Windows holds up every mouse event in the system
+# until the hook returns, and a Python hook first needs the GIL. While Whisper,
+# the GUI or a hung call keep the GIL, the whole PC stops reacting to the mouse
+# and keyboard (with LowLevelHooksTimeout raised, for seconds per event).
+# So the hook lives in overlay-guard.exe (native/overlay_guard.cpp). The overlay
+# only keeps a message-only window whose title lists its bindings; the guard
+# posts matching presses to it and swallows them. PostMessage never waits, so a
+# busy overlay can delay its own action, never the mouse.
 
-WH_MOUSE_LL = 14
 WM_QUIT = 0x0012
-WM_MBUTTONDOWN, WM_MBUTTONUP = 0x0207, 0x0208
-WM_XBUTTONDOWN, WM_XBUTTONUP = 0x020B, 0x020C
-LLMHF_INJECTED = 0x1
-LRESULT = ctypes.c_ssize_t
-HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+WM_OVERLAY_MOUSE = 0x8000 + 2  # WM_APP + 2, as in overlay_guard.cpp
+MOUSE_SINK_CLASS = "AiOverlayMouseSink"
+HWND_MESSAGE = wintypes.HWND(-3)
 kernel32 = ctypes.windll.kernel32
 
-
-class MSLLHOOKSTRUCT(ctypes.Structure):
-    _fields_ = [("pt", wintypes.POINT), ("mouseData", wintypes.DWORD), ("flags", wintypes.DWORD),
-                ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
-
-
-user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD]
-user32.SetWindowsHookExW.restype = wintypes.HHOOK
-user32.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
-user32.CallNextHookEx.restype = LRESULT
-user32.UnhookWindowsHookEx.argtypes = [wintypes.HHOOK]
 user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
 user32.GetMessageW.restype = wintypes.BOOL
 user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
-user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
-user32.GetAsyncKeyState.restype = ctypes.c_short
+user32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+                                   ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                   wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+user32.CreateWindowExW.restype = wintypes.HWND
+user32.DestroyWindow.argtypes = [wintypes.HWND]
 kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+kernel32.OpenMutexW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+kernel32.OpenMutexW.restype = wintypes.HANDLE
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 
 
-def held_modifiers() -> int:
-    """Ctrl/Alt/Shift/Win held right now, as core.MOD_* bits."""
-    def down(vk):
-        return user32.GetAsyncKeyState(vk) & 0x8000
-    mods = 0
-    if down(0x11):
-        mods |= core.MOD_CONTROL
-    if down(0x12):
-        mods |= core.MOD_ALT
-    if down(0x10):
-        mods |= core.MOD_SHIFT
-    if down(0x5B) or down(0x5C):
-        mods |= core.MOD_WIN
-    return mods
+class _WNDCLASSW(ctypes.Structure):
+    _fields_ = [("style", wintypes.UINT), ("lpfnWndProc", ctypes.c_void_p),
+                ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HICON),
+                ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HBRUSH),
+                ("lpszMenuName", wintypes.LPCWSTR), ("lpszClassName", wintypes.LPCWSTR)]
+
+
+_sink_class_registered = False
+
+
+def _register_sink_class():
+    """The window procedure is DefWindowProcW itself: no Python callback anywhere."""
+    global _sink_class_registered
+    if _sink_class_registered:
+        return
+    wc = _WNDCLASSW()
+    wc.lpfnWndProc = ctypes.cast(user32.DefWindowProcW, ctypes.c_void_p).value
+    wc.hInstance = kernel32.GetModuleHandleW(None)
+    wc.lpszClassName = MOUSE_SINK_CLASS
+    if not user32.RegisterClassW(ctypes.byref(wc)):
+        raise OSError(ctypes.GetLastError(), "RegisterClassW")
+    _sink_class_registered = True
+
+
+def _guard_running() -> bool:
+    handle = kernel32.OpenMutexW(0x00100000, False, r"Local\ai-overlay-guard")  # SYNCHRONIZE
+    if handle:
+        kernel32.CloseHandle(handle)
+    return bool(handle)
 
 
 class MouseHotkeys(QtCore.QObject):
     """Mouse buttons (wheel click, side buttons) with optional modifiers as global hotkeys.
 
-    A matched click is swallowed, so a side button does not also go "back" in a browser.
+    overlay-guard.exe catches them and swallows the click, so a side button does
+    not also go "back" in a browser. Without the guard they do nothing.
     """
 
     pressed = Signal(str)  # action name
 
     def __init__(self):
         super().__init__()
-        self.bindings: dict[tuple[int, str], str] = {}  # (modifiers, button) -> action
         self.failed: list[str] = []
-        self._swallowed: set[str] = set()  # buttons whose release must be swallowed too
-        self._proc = HOOKPROC(self._hook)  # must stay referenced while the hook is set
+        self.problem = ""
         self._thread = None
         self._thread_id = 0
-        self._ready = threading.Event()
 
     def set_bindings(self, mapping: dict[str, str]):
         """mapping: action -> combo ('ctrl+mouse4'); empty combos are skipped."""
-        bindings, self.failed = {}, []
+        self.stop()
+        bindings, self.failed, self.problem = {}, [], ""
         for action, combo in mapping.items():
             if not combo:
                 continue
             try:
-                key = core.parse_mouse(combo)
+                mods, button = core.parse_mouse(combo)
             except ValueError as exc:
                 log.warning("%s", exc)
                 self.failed.append(combo)
                 continue
-            bindings[key] = action
-        self.bindings = bindings
-        if bindings and self._thread is None:
-            self._ready.clear()
-            self._thread = threading.Thread(target=self._run, name="mouse-hook", daemon=True)
-            self._thread.start()
-            self._ready.wait(2)
-        elif not bindings:
-            self.stop()
+            bindings[(mods, int(button[len("mouse"):]))] = action
+        if not bindings:
+            return
+        if not _guard_running():
+            self.problem = ("Кнопки миші працюють, лише коли оверлей запущено через run.bat "
+                            "(overlay-guard.exe).")
+        ready = threading.Event()
+        self._thread = threading.Thread(target=self._run, args=(bindings, ready),
+                                        name="mouse-sink", daemon=True)
+        self._thread.start()
+        ready.wait(2)
 
     def stop(self):
         thread, self._thread = self._thread, None
@@ -260,39 +275,28 @@ class MouseHotkeys(QtCore.QObject):
             user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
             thread.join(2)
 
-    def _run(self):
+    def _run(self, bindings: dict[tuple[int, int], str], ready: threading.Event):
         self._thread_id = kernel32.GetCurrentThreadId()
-        hook = user32.SetWindowsHookExW(WH_MOUSE_LL, self._proc, kernel32.GetModuleHandleW(None), 0)
-        self._ready.set()
-        if not hook:
-            log.error("mouse hook failed: %s", ctypes.GetLastError())
+        title = "ai-overlay-mouse:" + ",".join(f"{button}.{mods}" for mods, button in bindings)
+        try:
+            _register_sink_class()
+            hwnd = user32.CreateWindowExW(0, MOUSE_SINK_CLASS, title, 0, 0, 0, 0, 0,
+                                          HWND_MESSAGE, None, kernel32.GetModuleHandleW(None), None)
+        except OSError:
+            hwnd = None
+        ready.set()  # the thread has a message queue now: stop() can reach it
+        if not hwnd:
+            log.error("mouse hotkey window failed: %s", ctypes.GetLastError())
             return
         msg = wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            pass
-        user32.UnhookWindowsHookEx(hook)
-
-    def _hook(self, code, wparam, lparam):
-        try:
-            if code == 0 and wparam in (WM_MBUTTONDOWN, WM_MBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP):
-                info = MSLLHOOKSTRUCT.from_address(lparam)
-                if not info.flags & LLMHF_INJECTED:  # leave clicks sent by programs alone
-                    if wparam in (WM_MBUTTONDOWN, WM_MBUTTONUP):
-                        button = "mouse3"
-                    else:
-                        button = "mouse4" if (info.mouseData >> 16) == 1 else "mouse5"
-                    if wparam in (WM_MBUTTONDOWN, WM_XBUTTONDOWN):
-                        action = self.bindings.get((held_modifiers(), button))
-                        if action:
-                            self._swallowed.add(button)
-                            self.pressed.emit(action)  # queued to the GUI thread
-                            return 1
-                    elif button in self._swallowed:
-                        self._swallowed.discard(button)
-                        return 1
-        except Exception:  # noqa: BLE001 - never break the mouse
-            log.exception("mouse hook")
-        return user32.CallNextHookEx(None, code, wparam, lparam)
+            if msg.message == WM_OVERLAY_MOUSE:
+                action = bindings.get((int(msg.lParam), int(msg.wParam)))
+                if action:
+                    self.pressed.emit(action)  # queued to the GUI thread
+            else:
+                user32.DispatchMessageW(ctypes.byref(msg))
+        user32.DestroyWindow(hwnd)
 
 
 # ------------------------------------------------------- platform interface
